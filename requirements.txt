@@ -1,0 +1,11 @@
+discord.py>=2.4,<3
+Flask>=3.0,<4
+google-api-python-client>=2.180,<3
+google-auth>=2.40,<3
+google-auth-oauthlib>=1.2,<2
+google-auth-httplib2>=0.2,<1
+cryptography>=44,<47
+python-dotenv>=1.0,<2
+pypdf>=5,<7
+python-docx>=1.1,<2
+requests>=2.32,<3
