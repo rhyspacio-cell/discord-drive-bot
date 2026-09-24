@@ -8,6 +8,7 @@ import asyncio
 import threading
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 from modules.config import (
@@ -16,8 +17,8 @@ from modules.config import (
     OAUTH_HOST,
     OAUTH_PORT,
 )
-from modules.drive import collect_drive_documents
-from modules.llm import LocalLLMError, summarize_documents
+from modules.drive import DriveError, collect_drive_documents
+from modules.llm import LocalLLMError, answer_drive_question
 from modules.oauth import create_oauth_url, oauth_app
 from modules.storage import delete_credentials, load_credentials
 
@@ -36,6 +37,28 @@ class DriveBot(commands.Bot):
 
 
 bot = DriveBot()
+
+
+def split_discord_message(text: str, limit: int = 1900):
+    """Split text into Discord-safe chunks without cutting words when possible."""
+    chunks = []
+    remaining = text.strip()
+
+    while remaining:
+        if len(remaining) <= limit:
+            chunks.append(remaining)
+            break
+
+        split_at = remaining.rfind("\n", 0, limit + 1)
+        if split_at <= 0:
+            split_at = remaining.rfind(" ", 0, limit + 1)
+        if split_at <= 0:
+            split_at = limit
+
+        chunks.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip()
+
+    return chunks
 
 
 @bot.event
@@ -59,41 +82,60 @@ async def connect_drive(interaction: discord.Interaction):
 async def drive_status(interaction: discord.Interaction):
     credentials = load_credentials(interaction.user.id)
     if credentials:
-        message = "Your Google Drive is connected.\n\nUse `/summarize-drive` to generate a summary."
+        message = "Your Google Drive is connected.\n\nUse `/ask-drive` to ask a question."
     else:
         message = "Your Google Drive is not connected.\n\nUse `/connect-drive` first."
     await interaction.response.send_message(message, ephemeral=True)
 
 
 @bot.tree.command(
-    name="summarize-drive",
-    description="Summarize readable files in your Google Drive",
+    name="ask-drive",
+    description="Ask a question about Drive files matching indexed terms",
 )
-async def summarize_drive(interaction: discord.Interaction):
+@app_commands.describe(
+    search_query="Drive full-text search terms",
+    question="Question to answer using those Drive files",
+)
+async def ask_drive(
+    interaction: discord.Interaction,
+    search_query: str,
+    question: str,
+):
     await interaction.response.defer(ephemeral=True, thinking=True)
 
     try:
-        documents = await asyncio.to_thread(collect_drive_documents, interaction.user.id)
-        summary = await asyncio.to_thread(summarize_documents, documents)
-        await interaction.followup.send(
-            f"**Google Drive Summary**\nReadable files: {len(documents)}\n\n{summary}",
-            ephemeral=True,
+        documents, skipped_files = await asyncio.to_thread(
+            collect_drive_documents,
+            interaction.user.id,
+            search_query,
         )
+        answer = await asyncio.to_thread(answer_drive_question, question, documents)
+        skipped_notice = (
+            f"\nSkipped oversized files: {len(skipped_files)}"
+            if skipped_files
+            else ""
+        )
+        message_chunks = split_discord_message(
+            f"**Google Drive Answer**\nReadable matching files: {len(documents)}"
+            f"{skipped_notice}\n\n{answer}"
+        )
+        for message_chunk in message_chunks:
+            await interaction.followup.send(message_chunk, ephemeral=True)
     except LocalLLMError as exc:
         print("[LLM ERROR]", repr(exc))
         await interaction.followup.send(
-            "⚠️ I couldn't summarize your Drive because the local AI model is unavailable "
+            "⚠️ I couldn't answer your Drive question because the local AI model is unavailable "
             f"or misconfigured.\n\n**Details:** {exc}",
             ephemeral=True,
         )
-    except RuntimeError as exc:
+    except DriveError as exc:
         print("[DRIVE ERROR]", repr(exc))
         await interaction.followup.send(
             f"⚠️ I couldn't read your Google Drive.\n\n**Details:** {exc}",
             ephemeral=True,
         )
     except Exception as exc:
-        print("[UNEXPECTED ERROR]", "summarize_drive", type(exc).__name__, repr(exc))
+        print("[UNEXPECTED ERROR]", "ask_drive", type(exc).__name__, repr(exc))
         await interaction.followup.send(
             "⚠️ An unexpected error occurred while processing your Drive. "
             "Check the bot's console logs for details.",

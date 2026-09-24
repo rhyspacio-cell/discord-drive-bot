@@ -5,15 +5,27 @@ from googleapiclient.http import MediaIoBaseDownload
 from pypdf import PdfReader
 from docx import Document
 
-from modules.config import MAX_CHARS_PER_FILE, MAX_FILES, MAX_TOTAL_CHARS
+from modules.config import MAX_CHARS_PER_FILE, MAX_DOWNLOAD_BYTES, MAX_FILES, MAX_TOTAL_CHARS
 from modules.storage import load_credentials, save_credentials
+
+class DriveError(RuntimeError):
+    """Raised when Google Drive access or file extraction fails."""
+    pass
+
+
+class DriveFileTooLargeError(DriveError):
+    """Raised when a file exceeds the configured download limit."""
 
 
 def get_drive_service(discord_user_id: int):
     """Create a Google Drive API client for one Discord user."""
     credentials = load_credentials(discord_user_id)
     if not credentials:
-        raise RuntimeError("Your Google Drive is not connected. Use /connect-drive first.")
+        raise DriveError(
+            "Google Drive could not be accessed. "
+            "Make sure your Drive is connected and "
+            "that the Google authorization is still valid."
+            )
 
     if credentials.expired and credentials.refresh_token:
         from google.auth.transport.requests import Request
@@ -31,6 +43,10 @@ def download_drive_file(service, file_id: str):
     finished = False
     while not finished:
         _, finished = downloader.next_chunk()
+        if buffer.tell() > MAX_DOWNLOAD_BYTES:
+            raise DriveFileTooLargeError(
+                f"File exceeds the {MAX_DOWNLOAD_BYTES} byte download limit."
+            )
     return buffer.getvalue()
 
 
@@ -52,32 +68,68 @@ def extract_file_text(service, file_info):
         data = service.files().export(fileId=file_id, mimeType="text/csv").execute()
         return filename, data.decode("utf-8", errors="replace")
 
+    is_pdf = mime_type == "application/pdf" or filename.lower().endswith(".pdf")
+    is_docx = (
+        mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        or filename.lower().endswith(".docx")
+    )
+    text_extensions = (".txt", ".md", ".csv", ".json", ".xml", ".html", ".py", ".js", ".ts", ".css", ".sql")
+    is_text = mime_type.startswith("text/") or filename.lower().endswith(text_extensions)
+
+    if not is_pdf and not is_docx and not is_text:
+        return filename, ""
+
     raw = download_drive_file(service, file_id)
 
-    if mime_type == "application/pdf" or filename.lower().endswith(".pdf"):
+    if is_pdf:
         reader = PdfReader(io.BytesIO(raw))
-        pages = [page.extract_text() or "" for page in reader.pages]
-        return filename, "\n".join(pages)
+        extracted = []
+        character_count = 0
+        for page in reader.pages:
+            page_text = page.extract_text() or ""
+            remaining = MAX_CHARS_PER_FILE - character_count
+            if remaining <= 0:
+                break
+            extracted.append(page_text[:remaining])
+            character_count += len(extracted[-1])
+        return filename, "\n".join(extracted)
 
-    if mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document" or filename.lower().endswith(".docx"):
+    if is_docx:
         document = Document(io.BytesIO(raw))
         paragraphs = [paragraph.text for paragraph in document.paragraphs]
         return filename, "\n".join(paragraphs)
 
-    text_extensions = (".txt", ".md", ".csv", ".json", ".xml", ".html", ".py", ".js", ".ts", ".css", ".sql")
-    if mime_type.startswith("text/") or filename.lower().endswith(text_extensions):
+    if is_text:
         return filename, raw.decode("utf-8", errors="replace")
 
     return filename, ""
 
 
-def collect_drive_documents(discord_user_id: int):
-    """Find and extract readable files belonging to this user's connected Drive."""
+def collect_drive_documents(discord_user_id: int, search_query: str):
+    """
+    Read matching non-trashed, non-folder files accessible to the Google
+    account connected to this Discord user.
+
+    Shared files are intentionally included when the connected Google account
+    has permission to read them. ``search_query`` is passed to Drive's
+    token-based full-text index; it is not an arbitrary substring search.
+    Results are ordered by modification time and limited by MAX_FILES,
+    MAX_CHARS_PER_FILE, and MAX_TOTAL_CHARS.
+    """
     try:
         service = get_drive_service(discord_user_id)
-        query = "trashed = false and mimeType != 'application/vnd.google-apps.folder'"
+        # Intentionally includes files shared with the connected Google account.
+        escaped_query = search_query.strip().replace("\\", "\\\\").replace("'", "\\'")
+        if not escaped_query:
+            raise DriveError("Enter a search query to find Drive files.")
+        query = (
+            "trashed = false and "
+            "mimeType != 'application/vnd.google-apps.folder' and "
+            f"fullText contains '{escaped_query}'"
+        )
 
         documents = []
+        skipped_files = []
         total_characters = 0
         page_token = None
         seen = 0
@@ -97,7 +149,6 @@ def collect_drive_documents(discord_user_id: int):
                         "name,"
                         "mimeType,"
                         "modifiedTime,"
-                        "webViewLink"
                         ")"
                     ),
                 )
@@ -111,6 +162,11 @@ def collect_drive_documents(discord_user_id: int):
 
                 try:
                     filename, text = extract_file_text(service, file_info)
+                except DriveFileTooLargeError as exc:
+                    filename = file_info.get("name", "Unnamed file")
+                    skipped_files.append(filename)
+                    print("[FILE SKIPPED]", filename, str(exc))
+                    continue
                 except Exception as exc:
                     print("[FILE ERROR]", file_info.get("name"), type(exc).__name__, repr(exc))
                     continue
@@ -121,7 +177,7 @@ def collect_drive_documents(discord_user_id: int):
                 text = text[:MAX_CHARS_PER_FILE]
                 remaining = MAX_TOTAL_CHARS - total_characters
                 if remaining <= 0:
-                    return documents
+                    return documents, skipped_files
                 text = text[:remaining]
                 total_characters += len(text)
 
@@ -140,10 +196,14 @@ def collect_drive_documents(discord_user_id: int):
             if not page_token:
                 break
 
-        return documents
+        return documents, skipped_files
 
+    except DriveError:
+        raise
     except Exception as exc:
         print("[DRIVE FETCH ERROR]", type(exc).__name__, repr(exc))
-        raise RuntimeError(
-            "Google Drive could not be accessed. Make sure your Drive is connected and the Google authorization is still valid."
-        ) from exc
+        raise DriveError(
+            "Google Drive could not be accessed. "
+            "Make sure your Drive is connected and "
+            "that the Google authorization is still valid."
+            ) from exc

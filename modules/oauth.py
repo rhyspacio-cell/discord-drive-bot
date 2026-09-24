@@ -3,7 +3,7 @@ import threading
 import time
 from urllib.parse import urlencode
 
-from flask import Flask, redirect, request
+from flask import Flask, redirect, request, session
 from google_auth_oauthlib.flow import Flow
 
 from modules.config import GOOGLE_CLIENT_SECRET_FILE, OAUTH_REDIRECT_URI, OAUTH_STATE_TTL, SCOPES
@@ -27,8 +27,17 @@ def create_oauth_flow():
 
 def create_oauth_url(discord_user_id: int):
     """Create the URL a Discord user opens to authorize Google."""
+    oauth_state = secrets.token_urlsafe(32)
+    with oauth_states_lock:
+        prune_expired_oauth_states(oauth_states)
+        oauth_states[oauth_state] = {
+            "discord_user_id": str(discord_user_id),
+            "created": time.time(),
+            "started": False,
+        }
+
     base_url = OAUTH_REDIRECT_URI.rsplit("/oauth2/callback", 1)[0]
-    return base_url + "/oauth2/start?" + urlencode({"discord_user_id": str(discord_user_id)})
+    return base_url + "/oauth2/start?" + urlencode({"state": oauth_state})
 
 
 def prune_expired_oauth_states(oauth_states):
@@ -45,14 +54,24 @@ def prune_expired_oauth_states(oauth_states):
 
 def oauth_start(oauth_states, oauth_states_lock):
     """Begin the Google OAuth process."""
-    discord_user_id = request.args.get("discord_user_id")
-    if not discord_user_id or not discord_user_id.isdigit():
-        return "Invalid Discord user ID.", 400
+    state = request.args.get("state")
+    if not state:
+        return "Missing OAuth state.", 400
 
-    state = secrets.token_urlsafe(32)
     with oauth_states_lock:
         prune_expired_oauth_states(oauth_states)
-        oauth_states[state] = {"discord_user_id": discord_user_id, "created": time.time()}
+        transaction = oauth_states.get(state)
+        if transaction and transaction["started"]:
+            return "OAuth authorization has already started for this state.", 400
+        if transaction:
+            transaction["started"] = True
+            transaction["browser_nonce"] = secrets.token_urlsafe(32)
+
+    if not transaction:
+        return "Invalid or expired OAuth state.", 400
+
+    session["oauth_state"] = state
+    session["oauth_nonce"] = transaction["browser_nonce"]
 
     flow = create_oauth_flow()
     authorization_url, _ = flow.authorization_url(
@@ -68,16 +87,29 @@ def oauth_callback(oauth_states, oauth_states_lock):
     """Receive Google's OAuth callback and save credentials."""
     error = request.args.get("error")
     if error:
-        return f"Google authorization failed: {error}", 400
+        print("[OAUTH ERROR]", "oauth_callback", error)
+        return "Google authorization was cancelled or failed.", 400
 
     state = request.args.get("state")
     code = request.args.get("code")
 
     with oauth_states_lock:
         prune_expired_oauth_states(oauth_states)
-        state_data = oauth_states.pop(state, None) if state else None
+        state_data = oauth_states.get(state) if state else None
+        session_matches = bool(
+            state_data
+            and session.get("oauth_state") == state
+            and session.get("oauth_nonce") == state_data.get("browser_nonce")
+        )
+        if session_matches:
+            state_data = oauth_states.pop(state)
 
-    if not state_data or time.time() - state_data["created"] > OAUTH_STATE_TTL:
+    if (
+        not state_data
+        or not state_data["started"]
+        or not session_matches
+        or time.time() - state_data["created"] > OAUTH_STATE_TTL
+    ):
         return "Invalid or expired OAuth state.", 400
 
     if not code:

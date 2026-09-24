@@ -3,6 +3,43 @@
 All notable changes to this project will be documented in this file.
 ---
 
+## [Unreleased] - 2026-09-24
+
+### Changed
+
+#### Discord Bot
+
+* Replaced `/summarize-drive` with `/ask-drive`.
+* Added separate `search_query` and `question` parameters so users can ask questions about matching Drive content.
+* Split long answers into Discord-safe ephemeral messages.
+* Clarified readable-file and skipped-oversized-file counts in responses.
+
+#### Google Drive
+
+* Added Drive full-text filtering before file extraction.
+* Added configurable `MAX_DOWNLOAD_BYTES` protection for supported downloadable files.
+* Skip oversized downloadable files instead of failing the entire request.
+* Stop PDF extraction after reaching `MAX_CHARS_PER_FILE`.
+* Avoid downloading unsupported file types.
+* Clarified that shared files accessible to the connected Google account are included.
+
+#### Local AI
+
+* Replaced document summarization with question answering grounded in matching Drive content.
+* Preserved prompt-injection protections for untrusted Drive documents.
+
+#### Configuration and Documentation
+
+* Load configuration from the project-root `.env` file.
+* Documented read-only Google Drive access and OAuth browser/session binding.
+* Documented process-local OAuth transaction storage and resource limits.
+
+### Security
+
+* Bound OAuth transactions to server-generated state, the initiating Discord user, and the browser session.
+* Made OAuth states single-use at both authorization start and callback.
+* Prevented arbitrary OAuth error query values from being reflected in responses.
+
 ## [0.1.0] - 2026-09-24
 
 ### Added
