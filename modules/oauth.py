@@ -6,28 +6,38 @@ from urllib.parse import urlencode
 from flask import Flask, redirect, request, session
 from google_auth_oauthlib.flow import Flow
 
-from modules.config import GOOGLE_CLIENT_SECRET_FILE, OAUTH_REDIRECT_URI, OAUTH_STATE_TTL, SCOPES
+from modules.config import (
+    GOOGLE_CLIENT_SECRET_FILE,
+    OAUTH_REDIRECT_URI,
+    OAUTH_STATE_TTL,
+    SCOPES,
+)
 from modules.storage import save_credentials
 
 
 oauth_app = Flask(__name__)
-oauth_app.secret_key = __import__("modules.config", fromlist=["FLASK_SECRET_KEY"]).FLASK_SECRET_KEY
+oauth_app.secret_key = __import__(
+    "modules.config", fromlist=["FLASK_SECRET_KEY"]
+).FLASK_SECRET_KEY
+
 oauth_states = {}
 oauth_states_lock = threading.Lock()
 
 
-def create_oauth_flow():
+def create_oauth_flow(code_verifier=None):
     """Create a Google OAuth flow."""
     return Flow.from_client_secrets_file(
         GOOGLE_CLIENT_SECRET_FILE,
         scopes=SCOPES,
         redirect_uri=OAUTH_REDIRECT_URI,
+        code_verifier=code_verifier,
     )
 
 
 def create_oauth_url(discord_user_id: int):
     """Create the URL a Discord user opens to authorize Google."""
     oauth_state = secrets.token_urlsafe(32)
+
     with oauth_states_lock:
         prune_expired_oauth_states(oauth_states)
         oauth_states[oauth_state] = {
@@ -48,6 +58,7 @@ def prune_expired_oauth_states(oauth_states):
         for state, data in oauth_states.items()
         if now - data["created"] > OAUTH_STATE_TTL
     ]
+
     for state in expired:
         oauth_states.pop(state, None)
 
@@ -55,14 +66,18 @@ def prune_expired_oauth_states(oauth_states):
 def oauth_start(oauth_states, oauth_states_lock):
     """Begin the Google OAuth process."""
     state = request.args.get("state")
+
     if not state:
         return "Missing OAuth state.", 400
 
     with oauth_states_lock:
         prune_expired_oauth_states(oauth_states)
+
         transaction = oauth_states.get(state)
+
         if transaction and transaction["started"]:
             return "OAuth authorization has already started for this state.", 400
+
         if transaction:
             transaction["started"] = True
             transaction["browser_nonce"] = secrets.token_urlsafe(32)
@@ -74,18 +89,32 @@ def oauth_start(oauth_states, oauth_states_lock):
     session["oauth_nonce"] = transaction["browser_nonce"]
 
     flow = create_oauth_flow()
+
     authorization_url, _ = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
         prompt="consent",
         state=state,
     )
+
+    # The verifier is generated/stored on this Flow object.
+    # Preserve it so the callback can use the same verifier
+    # when exchanging the authorization code for tokens.
+    with oauth_states_lock:
+        transaction = oauth_states.get(state)
+
+        if not transaction:
+            return "Invalid or expired OAuth state.", 400
+
+        transaction["code_verifier"] = flow.code_verifier
+
     return redirect(authorization_url)
 
 
 def oauth_callback(oauth_states, oauth_states_lock):
     """Receive Google's OAuth callback and save credentials."""
     error = request.args.get("error")
+
     if error:
         print("[OAUTH ERROR]", "oauth_callback", error)
         return "Google authorization was cancelled or failed.", 400
@@ -95,12 +124,15 @@ def oauth_callback(oauth_states, oauth_states_lock):
 
     with oauth_states_lock:
         prune_expired_oauth_states(oauth_states)
+
         state_data = oauth_states.get(state) if state else None
+
         session_matches = bool(
             state_data
             and session.get("oauth_state") == state
             and session.get("oauth_nonce") == state_data.get("browser_nonce")
         )
+
         if session_matches:
             state_data = oauth_states.pop(state)
 
@@ -115,10 +147,21 @@ def oauth_callback(oauth_states, oauth_states_lock):
     if not code:
         return "Missing OAuth code.", 400
 
+    code_verifier = state_data.get("code_verifier")
+
+    if not code_verifier:
+        print("[OAUTH ERROR]", "oauth_callback", "Missing stored code verifier.")
+        return "Unable to complete Google authorization.", 500
+
     try:
-        flow = create_oauth_flow()
+        flow = create_oauth_flow(code_verifier=code_verifier)
         flow.fetch_token(code=code)
-        save_credentials(int(state_data["discord_user_id"]), flow.credentials)
+
+        save_credentials(
+            int(state_data["discord_user_id"]),
+            flow.credentials,
+        )
+
     except Exception as exc:
         print("[OAUTH ERROR]", "oauth_callback", repr(exc))
         return "Unable to complete Google authorization.", 500
