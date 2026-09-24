@@ -10,7 +10,7 @@ All notable changes to this project will be documented in this file.
 #### Discord Bot
 
 * Replaced `/summarize-drive` with `/ask-drive`.
-* Added separate `search_query` and `question` parameters so users can ask questions about matching Drive content.
+* Simplified `/ask-drive` to accept one natural-language question.
 * Split long answers into Discord-safe ephemeral messages.
 * Clarified readable-file and skipped-oversized-file counts in responses.
 
@@ -18,9 +18,14 @@ All notable changes to this project will be documented in this file.
 
 * Added Drive full-text filtering before file extraction.
 * Added natural keyword search across file names and indexed file content.
-* Try matching all meaningful search terms first, then broaden to any term when no readable files are found.
+* Require all meaningful search terms and limit extraction attempts before ranking candidates by filename and content relevance.
+* Added constrained Ollama search-plan interpretation before Drive retrieval.
+* Search planning now derives retrieval terms from the current question.
+* Added structured intent, phrase, context, exclusion, answer-type, and confidence fields.
+* Reduced the default candidate limit to 10 files and the total content limit to 30,000 characters.
 * Added configurable `MAX_DOWNLOAD_BYTES` protection for supported downloadable files.
 * Skip oversized downloadable files instead of failing the entire request.
+* Check Drive file size metadata before downloading oversized files.
 * Stop PDF extraction after reaching `MAX_CHARS_PER_FILE`.
 * Avoid downloading unsupported file types.
 * Clarified that shared files accessible to the connected Google account are included.

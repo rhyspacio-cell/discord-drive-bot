@@ -20,6 +20,7 @@ from modules.config import (
 from modules.drive import DriveError, collect_drive_documents
 from modules.llm import LocalLLMError, answer_drive_question
 from modules.oauth import create_oauth_url, oauth_app
+from modules.search import interpret_search_request
 from modules.storage import delete_credentials, load_credentials
 
 
@@ -90,24 +91,24 @@ async def drive_status(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="ask-drive",
-    description="Ask a question about Drive files matching indexed terms",
+    description="Ask a question about your Google Drive",
 )
 @app_commands.describe(
-    search_query="Drive full-text search terms",
-    question="Question to answer using those Drive files",
+    question="Question to answer using your Drive files",
 )
-async def ask_drive(
-    interaction: discord.Interaction,
-    search_query: str,
-    question: str,
-):
+async def ask_drive(interaction: discord.Interaction, question: str):
     await interaction.response.defer(ephemeral=True, thinking=True)
 
     try:
+        search_plan = await asyncio.to_thread(
+            interpret_search_request,
+            question,
+        )
         documents, skipped_files = await asyncio.to_thread(
             collect_drive_documents,
             interaction.user.id,
-            search_query,
+            question,
+            search_plan,
         )
         answer = await asyncio.to_thread(answer_drive_question, question, documents)
         skipped_notice = (

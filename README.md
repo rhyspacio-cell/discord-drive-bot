@@ -9,7 +9,7 @@ The bot is designed so that each Discord user connects their own Google Drive. O
 * 🔗 Connect a personal Google Drive account through OAuth
 * 🔐 Encrypt stored Google OAuth credentials
 * 📁 Read supported files from Google Drive
-* 🤖 Answer questions using a local Ollama model
+* 🤖 Interpret search requests and answer questions using a local Ollama model
 * 👤 Keep Google Drive connections associated with individual Discord users
 * 📊 Answer questions using multiple matching files
 * 🛡️ Limit the number of files and amount of text processed
@@ -22,7 +22,7 @@ The bot is designed so that each Discord user connects their own Google Drive. O
 | ------------------- | ------------------------------------------------- |
 | `/connect-drive`    | Connect your Google Drive account                 |
 | `/drive-status`     | Check whether your Google Drive is connected      |
-| `/ask-drive`       | Search indexed Drive terms and ask a question about matching results |
+| `/ask-drive`       | Ask a question about your Google Drive              |
 | `/disconnect-drive` | Delete the stored Google Drive connection         |
 
 ## Architecture
@@ -73,6 +73,7 @@ discord-drive-bot/
     ├── drive.py
     ├── llm.py
     ├── oauth.py
+     ├── search.py
     └── storage.py
 ```
 
@@ -145,6 +146,10 @@ Supported formats currently include:
 #### `modules/llm.py`
 
 Handles communication with the locally running Ollama server and answers questions using extracted Drive content.
+
+#### `modules/search.py`
+
+Uses Ollama to turn the user's search query and question into a constrained search plan. Python validates the plan and builds the Google Drive query.
 
 ## Requirements
 
@@ -274,10 +279,10 @@ TOKEN_ENCRYPTION_KEY=your_fernet_key
 LOCAL_LLM_MODEL=llama3.2:3b
 LOCAL_LLM_BASE_URL=http://localhost:11434
 
-MAX_FILES=30
+MAX_FILES=10
 MAX_DOWNLOAD_BYTES=10485760
 MAX_CHARS_PER_FILE=8000
-MAX_TOTAL_CHARS=50000
+MAX_TOTAL_CHARS=30000
 MAX_SUMMARY_CHARS=5000
 ```
 
@@ -335,10 +340,10 @@ can be used to verify the connection.
 Then:
 
 ```text
-/ask-drive search_query:<text> question:<question>
+/ask-drive question:<question>
 ```
 
-will search accessible Drive files whose names or indexed full text match the search terms, then attempt to extract text from supported matching files before sending their contents to the local Ollama model. The bot first requires all meaningful terms to match, then broadens the search to any term if no readable files are found. Drive matching is token-based, not arbitrary substring matching; the bot builds the Drive query from separate terms rather than treating the whole input as an exact phrase.
+will first ask Ollama to convert the question into a small structured search plan, then Python builds a safe Drive query from that plan. It searches accessible Drive files whose names or indexed full text match all required terms and phrases, limits extraction attempts to the top `MAX_FILES` metadata results, ranks those extracted candidates by filename and content relevance, and sends the best readable documents to Ollama. Optional plan terms influence ranking but do not allow the model to write Drive syntax. Drive matching is token-based, not arbitrary substring matching. The planner currently uses only the current question, not previous Discord conversation.
 
 ## File Processing Limits
 
@@ -347,14 +352,14 @@ The bot intentionally limits the amount of content it processes.
 Current defaults:
 
 ```text
-Maximum files:          30
+Maximum files:          10
 Maximum raw download size for supported downloadable files: 10 MiB
 Maximum characters/file: 8,000
-Maximum total characters: 50,000
+Maximum total characters: 30,000
 Maximum answer size:    5,000
 ```
 
-These limits help prevent very large Drive contents from creating excessive download, extraction, prompt, and answer workloads. Raw downloads for supported downloadable files are limited by `MAX_DOWNLOAD_BYTES` and files exceeding that limit are skipped. For supported downloadable files, character limits are applied after download; PDF extraction also stops once `MAX_CHARS_PER_FILE` is reached. Google Docs, Sheets, and Slides are exported through Drive and are not covered by the raw download limit.
+These limits help prevent very large Drive contents from creating excessive download, extraction, prompt, and answer workloads. Drive metadata is checked first so supported downloadable files exceeding `MAX_DOWNLOAD_BYTES` are skipped before download. For supported downloadable files, character limits are applied after download; PDF extraction also stops once `MAX_CHARS_PER_FILE` is reached. Google Docs, Sheets, and Slides are exported through Drive and are not covered by the raw download limit.
 
 They can be changed through the corresponding environment variables.
 
