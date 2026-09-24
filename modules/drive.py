@@ -113,8 +113,8 @@ def collect_drive_documents(discord_user_id: int, search_query: str):
     Shared files are intentionally included when the connected Google account
     has permission to read them. ``search_query`` is passed to Drive's
     token-based full-text index; it is not an arbitrary substring search.
-    Results are ordered by modification time and limited by MAX_FILES,
-    MAX_CHARS_PER_FILE, and MAX_TOTAL_CHARS.
+    Drive orders full-text results by relevance. Results are limited by
+    MAX_FILES, MAX_CHARS_PER_FILE, and MAX_TOTAL_CHARS.
     """
     try:
         service = get_drive_service(discord_user_id)
@@ -141,14 +141,13 @@ def collect_drive_documents(discord_user_id: int, search_query: str):
                     q=query,
                     pageSize=min(MAX_FILES - seen, 100) if MAX_FILES - seen > 0 else 1,
                     pageToken=page_token,
-                    orderBy="modifiedTime desc",
                     fields=(
                         "nextPageToken,"
                         "files("
                         "id,"
                         "name,"
                         "mimeType,"
-                        "modifiedTime,"
+                        "modifiedTime"
                         ")"
                     ),
                 )
