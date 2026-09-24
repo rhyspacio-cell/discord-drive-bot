@@ -1,4 +1,5 @@
 import io
+import re
 
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -7,6 +8,7 @@ from docx import Document
 
 from modules.config import MAX_CHARS_PER_FILE, MAX_DOWNLOAD_BYTES, MAX_FILES, MAX_TOTAL_CHARS
 from modules.storage import load_credentials, save_credentials
+
 
 class DriveError(RuntimeError):
     """Raised when Google Drive access or file extraction fails."""
@@ -105,97 +107,129 @@ def extract_file_text(service, file_info):
     return filename, ""
 
 
+SEARCH_STOP_WORDS = {
+    "a", "an", "and", "are", "for", "from", "in", "is", "my", "of",
+    "on", "or", "the", "to", "was", "what", "when", "where", "which",
+    "who", "with",
+}
+
+
+def build_drive_search_queries(search_query: str):
+    """Build strict and broadened Drive queries from natural search terms."""
+    terms = [
+        term
+        for term in re.findall(r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)*", search_query.lower())
+        if term not in SEARCH_STOP_WORDS
+    ]
+    if not terms:
+        raise DriveError("Enter meaningful search terms to find Drive files.")
+
+    def escape(term):
+        return term.replace("\\", "\\\\").replace("'", "\\'")
+
+    clauses = [
+        f"(name contains '{escape(term)}' or fullText contains '{escape(term)}')"
+        for term in terms
+    ]
+    base = "trashed = false and mimeType != 'application/vnd.google-apps.folder'"
+    strict_query = f"{base} and {' and '.join(clauses)}"
+    broad_query = strict_query if len(clauses) == 1 else f"{base} and ({' or '.join(clauses)})"
+    return strict_query, broad_query
+
+
+def _collect_documents_for_query(service, query):
+    """Extract readable documents for one Drive query."""
+    documents = []
+    skipped_files = []
+    total_characters = 0
+    page_token = None
+    seen = 0
+
+    while True:
+        response = (
+            service.files()
+            .list(
+                q=query,
+                pageSize=min(MAX_FILES - seen, 100) if MAX_FILES - seen > 0 else 1,
+                pageToken=page_token,
+                fields=(
+                    "nextPageToken,"
+                    "files("
+                    "id,"
+                    "name,"
+                    "mimeType,"
+                    "modifiedTime"
+                    ")"
+                ),
+            )
+            .execute()
+        )
+
+        for file_info in response.get("files", []):
+            if seen >= MAX_FILES:
+                break
+            seen += 1
+
+            try:
+                filename, text = extract_file_text(service, file_info)
+            except DriveFileTooLargeError as exc:
+                filename = file_info.get("name", "Unnamed file")
+                skipped_files.append(filename)
+                print("[FILE SKIPPED]", filename, str(exc))
+                continue
+            except Exception as exc:
+                print("[FILE ERROR]", file_info.get("name"), type(exc).__name__, repr(exc))
+                continue
+
+            if not text.strip():
+                continue
+
+            text = text[:MAX_CHARS_PER_FILE]
+            remaining = MAX_TOTAL_CHARS - total_characters
+            if remaining <= 0:
+                return documents, skipped_files
+            text = text[:remaining]
+            total_characters += len(text)
+
+            documents.append(
+                {
+                    "name": filename,
+                    "modifiedTime": file_info.get("modifiedTime", ""),
+                    "text": text,
+                }
+            )
+
+        if seen >= MAX_FILES:
+            break
+
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+
+    return documents, skipped_files
+
+
 def collect_drive_documents(discord_user_id: int, search_query: str):
     """
     Read matching non-trashed, non-folder files accessible to the Google
     account connected to this Discord user.
 
     Shared files are intentionally included when the connected Google account
-    has permission to read them. ``search_query`` is passed to Drive's
-    token-based full-text index; it is not an arbitrary substring search.
-    Drive orders full-text results by relevance. Results are limited by
-    MAX_FILES, MAX_CHARS_PER_FILE, and MAX_TOTAL_CHARS.
+    has permission to read them. Natural-language search terms are matched
+    against both file names and Drive's token-based full-text index. All
+    meaningful terms are tried first; if that finds no readable files, the
+    search broadens to match any term. Results are limited by MAX_FILES,
+    MAX_CHARS_PER_FILE, and MAX_TOTAL_CHARS.
     """
     try:
         service = get_drive_service(discord_user_id)
-        # Intentionally includes files shared with the connected Google account.
-        escaped_query = search_query.strip().replace("\\", "\\\\").replace("'", "\\'")
-        if not escaped_query:
-            raise DriveError("Enter a search query to find Drive files.")
-        query = (
-            "trashed = false and "
-            "mimeType != 'application/vnd.google-apps.folder' and "
-            f"fullText contains '{escaped_query}'"
-        )
+        strict_query, broad_query = build_drive_search_queries(search_query)
+        documents, skipped_files = _collect_documents_for_query(service, strict_query)
+        if documents or strict_query == broad_query:
+            return documents, skipped_files
 
-        documents = []
-        skipped_files = []
-        total_characters = 0
-        page_token = None
-        seen = 0
-
-        while True:
-            response = (
-                service.files()
-                .list(
-                    q=query,
-                    pageSize=min(MAX_FILES - seen, 100) if MAX_FILES - seen > 0 else 1,
-                    pageToken=page_token,
-                    fields=(
-                        "nextPageToken,"
-                        "files("
-                        "id,"
-                        "name,"
-                        "mimeType,"
-                        "modifiedTime"
-                        ")"
-                    ),
-                )
-                .execute()
-            )
-
-            for file_info in response.get("files", []):
-                if seen >= MAX_FILES:
-                    break
-                seen += 1
-
-                try:
-                    filename, text = extract_file_text(service, file_info)
-                except DriveFileTooLargeError as exc:
-                    filename = file_info.get("name", "Unnamed file")
-                    skipped_files.append(filename)
-                    print("[FILE SKIPPED]", filename, str(exc))
-                    continue
-                except Exception as exc:
-                    print("[FILE ERROR]", file_info.get("name"), type(exc).__name__, repr(exc))
-                    continue
-
-                if not text.strip():
-                    continue
-
-                text = text[:MAX_CHARS_PER_FILE]
-                remaining = MAX_TOTAL_CHARS - total_characters
-                if remaining <= 0:
-                    return documents, skipped_files
-                text = text[:remaining]
-                total_characters += len(text)
-
-                documents.append(
-                    {
-                        "name": filename,
-                        "modifiedTime": file_info.get("modifiedTime", ""),
-                        "text": text,
-                    }
-                )
-
-            if seen >= MAX_FILES:
-                break
-
-            page_token = response.get("nextPageToken")
-            if not page_token:
-                break
-
-        return documents, skipped_files
+        broad_documents, broad_skipped_files = _collect_documents_for_query(service, broad_query)
+        return broad_documents, skipped_files + broad_skipped_files
 
     except DriveError:
         raise

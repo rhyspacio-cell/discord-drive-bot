@@ -17,6 +17,8 @@ All notable changes to this project will be documented in this file.
 #### Google Drive
 
 * Added Drive full-text filtering before file extraction.
+* Added natural keyword search across file names and indexed file content.
+* Try matching all meaningful search terms first, then broaden to any term when no readable files are found.
 * Added configurable `MAX_DOWNLOAD_BYTES` protection for supported downloadable files.
 * Skip oversized downloadable files instead of failing the entire request.
 * Stop PDF extraction after reaching `MAX_CHARS_PER_FILE`.

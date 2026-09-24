@@ -338,7 +338,7 @@ Then:
 /ask-drive search_query:<text> question:<question>
 ```
 
-will search accessible Drive files whose indexed full text matches the search query, then attempt to extract text from supported matching files before sending their contents to the local Ollama model. Drive full-text matching is token-based, not arbitrary substring matching; a multi-word value is passed as one Drive search value, with exact matching semantics controlled by Google Drive's query parser rather than the bot.
+will search accessible Drive files whose names or indexed full text match the search terms, then attempt to extract text from supported matching files before sending their contents to the local Ollama model. The bot first requires all meaningful terms to match, then broadens the search to any term if no readable files are found. Drive matching is token-based, not arbitrary substring matching; the bot builds the Drive query from separate terms rather than treating the whole input as an exact phrase.
 
 ## File Processing Limits
 
