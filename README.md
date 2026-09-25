@@ -12,6 +12,9 @@ The bot is designed so that each Discord user connects their own Google Drive. O
 * 🤖 Interpret search requests and answer questions using a local Ollama model
 * 👤 Keep Google Drive connections associated with individual Discord users
 * 📊 Answer questions using multiple matching files
+* 🎯 Rank matching files by filename, phrase, and content relevance
+* 🔁 Retry transient Google Drive API and download failures
+* 🔗 Resolve Google Drive shortcuts when their targets are accessible
 * 🛡️ Limit the number of files and amount of text processed
 * 🧱 Treat Drive document contents as untrusted data to reduce prompt-injection risks
 * 🔌 Disconnect and delete a user's stored Drive credentials
@@ -59,6 +62,9 @@ Discord User
             File Extraction
              │
              ▼
+           Relevance Ranking + Audit
+                │
+                ▼
         Local Ollama
              │
              ▼
@@ -155,7 +161,7 @@ Handles communication with the locally running Ollama server and answers questio
 
 #### `modules/search.py`
 
-Uses Ollama to turn the user's current question into a constrained search plan. Python validates the plan and builds the Google Drive query. Previous Discord conversation is not used.
+Uses Ollama to turn the user's current question into a constrained, JSON-schema-validated search plan. Python normalizes and validates the plan, builds the Google Drive query, ranks extracted files, and records a factual processing audit. Person names are used to identify files, while terms describing requested information such as current employment guide ranking and answer extraction. Previous Discord conversation is not used.
 
 ## Requirements
 
@@ -349,7 +355,7 @@ Then:
 /ask-drive question:<question>
 ```
 
-will first ask Ollama to convert the question into a small structured search plan, then Python builds a safe broad candidate query from that plan. It searches accessible Drive files whose names or indexed full text match the candidate terms, retrieves up to `MAX_FILES * 3` metadata candidates, extracts at most `MAX_FILES` candidates, ranks extracted files by filename and content relevance, and sends the best readable documents to Ollama. Optional plan terms influence ranking but do not allow the model to write Drive syntax. Drive matching is token-based, not arbitrary substring matching. The planner currently uses only the current question, not previous Discord conversation.
+will first ask Ollama to convert the question into a small structured search plan, then Python builds a safe broad candidate query from that plan. It searches accessible Drive files whose names or indexed full text match the candidate terms, retrieves up to `MAX_FILES * 3` metadata candidates, resolves shortcuts, extracts at most `MAX_FILES` candidates, ranks extracted files by filename, phrase, and content relevance, and sends the best readable documents to Ollama. Optional plan terms influence ranking but do not allow the model to write Drive syntax. Drive matching is token-based, not arbitrary substring matching. Transient Drive API and download failures are retried. The response audit distinguishes files used, analyzed but not used, skipped, unreadable, and empty files. The planner currently uses only the current question, not previous Discord conversation.
 
 ## File Processing Limits
 
@@ -429,6 +435,8 @@ This is an early version and has several limitations.
 * Ollama must be running locally.
 * The bot currently supports only selected file formats.
 * Raw downloads for supported downloadable files are limited by MAX_DOWNLOAD_BYTES.
+* Transient Drive failures are retried, but persistent permission, missing-file,
+  and extraction errors are reported or skipped without retrying indefinitely.
 * For supported downloadable files, character limits are applied after
      download; PDF extraction also stops once MAX_CHARS_PER_FILE is reached.
 * Very large Drive collections are limited by configurable processing limits.

@@ -15,6 +15,64 @@ SEARCH_PLAN_KEYS = (
 )
 
 
+SEARCH_PLAN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "intent": {
+            "type": "string",
+        },
+        "required_terms": {
+            "type": "array",
+            "items": {
+                "type": "string",
+            },
+        },
+        "phrases": {
+            "type": "array",
+            "items": {
+                "type": "string",
+            },
+        },
+        "optional_terms": {
+            "type": "array",
+            "items": {
+                "type": "string",
+            },
+        },
+        "context_terms": {
+            "type": "array",
+            "items": {
+                "type": "string",
+            },
+        },
+        "exclude_terms": {
+            "type": "array",
+            "items": {
+                "type": "string",
+            },
+        },
+        "answer_type": {
+            "type": "string",
+        },
+        "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+        },
+    },
+    "required": [
+        "intent",
+        "required_terms",
+        "phrases",
+        "optional_terms",
+        "context_terms",
+        "exclude_terms",
+        "answer_type",
+        "confidence",
+    ],
+}
+
+
 def _normalize_value(value: str) -> str:
     """Normalize one search value returned by the local model."""
     value = value.strip().lower()
@@ -93,23 +151,24 @@ MEANING OF EACH CATEGORY:
   Terms that are genuinely useful for identifying the relevant documents.
   Use as few as possible.
 
-    Required terms must help identify the document itself. Prefer terms
-    describing the document type or subject of the requested information.
+  Required terms must help identify the document itself. Prefer terms
+  describing the document type or subject of the requested information.
 
-    For example, for:
-    "What degree was awarded in my Computer Science diploma?"
+  For example, for:
+  "What degree was awarded in my Computer Science diploma?"
 
-    Good required terms:
-    ["diploma"]
+  Good required terms:
+  ["diploma"]
 
-    Good phrase:
-    ["computer science diploma"]
+  Good phrase:
+  ["computer science"]
 
-    Do not make answer concepts such as "degree" or "awarded" required
-    terms unless they are themselves likely to identify the document.
+  Do not make answer concepts such as "degree" or "awarded" required
+  terms unless they are themselves likely to identify the document.
 
 - phrases:
   Important multi-word concepts that should stay together conceptually.
+
   Examples:
   "computer science"
   "bachelor of science"
@@ -119,13 +178,53 @@ MEANING OF EACH CATEGORY:
   Additional terms that may help find the right documents but are not
   necessary.
 
-- context_terms:
-  Words describing what the user wants to find or answer.
-  These are mainly useful for ranking documents after retrieval.
+  Optional terms should help identify relevant documents.
 
-    For example, "Who is John Smith and where does he currently work?"
-    should produce terms such as ["currently", "work", "employer"].
-    Do not put generic formatting words such as "paragraph" here.
+  Do NOT put generic question words or answer-context words such as:
+  "where"
+  "who"
+  "what"
+  "currently"
+  "working"
+  "works"
+  "working now"
+
+  into optional_terms when they describe the information the user wants.
+
+- context_terms:
+  Terms describing the specific information the user wants to retrieve
+  from the matching documents.
+
+  Examples:
+  "Where does John Smith currently work?" -> ["currently", "working"]
+  "What degree did John Smith receive?" -> ["degree", "received"]
+  "What was my final grade in thermodynamics?" -> ["final", "grade"]
+
+  Context terms describe the requested information, not the identity
+  of the person or document.
+
+  For employment questions, terms such as:
+  "currently", "working", "works", "employer", "employment", "job"
+  should normally be context_terms when they describe what the user
+  wants to know.
+
+  IMPORTANT:
+  Phrases such as:
+  "working now"
+  "currently working"
+  "works now"
+  "current employer"
+  "where they work"
+  "where is the person working"
+
+  describe the requested employment information. They should normally
+  be context_terms, NOT optional_terms.
+
+  Do not treat "working now" or similar employment phrases as a phrase
+  identifying the person.
+
+  Do not use generic formatting or question words such as:
+  "paragraph", "question", "answer", "who", "what", "where".
 
 - exclude_terms:
   Terms that should be excluded ONLY when the user's question clearly
@@ -190,6 +289,30 @@ IMPORTANT RULES:
 
 18. The question's subject is more important than generic question words.
 
+19. When the user asks what a person currently does, where they work,
+    or who employs them, treat employment-related words as context_terms,
+    not optional_terms, unless the word is specifically needed to identify
+    the relevant document.
+
+20. When an employment question contains "working now", "works now",
+    "currently working", "current employer", "where they work", or similar
+    wording, put those concepts in context_terms. Do NOT put them in
+    optional_terms unless there is an unusual and specific reason that the
+    phrase itself identifies a document.
+
+21. For a question about a person's current employment, the person's name
+    should normally be the primary phrase used to identify relevant files.
+    Employment words describe what information should be extracted from
+    those files; they are not normally the primary identity/search phrase.
+
+22. Generic question words such as "where", "who", and "what" should
+    normally NOT be used for Drive candidate retrieval.
+
+23. Employment-context words such as "currently", "working", "works",
+    "working now", "employer", "employment", and "job" should normally
+    NOT be used for Drive candidate retrieval when they only describe
+    what information the user wants from an already-identified document.
+
 EXAMPLE:
 
 Question:
@@ -199,10 +322,10 @@ Good JSON:
 
 {{
   "intent": "degree information",
-    "required_terms": ["diploma"],
-    "phrases": ["computer science diploma"],
-    "optional_terms": ["computer science"],
-    "context_terms": ["degree", "awarded"],
+  "required_terms": ["diploma"],
+  "phrases": ["computer science"],
+  "optional_terms": [],
+  "context_terms": ["degree", "awarded"],
   "exclude_terms": [],
   "answer_type": "degree",
   "confidence": 0.9
@@ -252,14 +375,32 @@ Give a small paragraph on who Rhys Pacio is and where he is currently working.
 Good JSON:
 
 {{
-    "intent": "person employment information",
-    "required_terms": ["rhys pacio"],
-    "phrases": ["rhys pacio"],
-    "optional_terms": ["employer"],
-    "context_terms": ["currently", "working"],
-    "exclude_terms": [],
-    "answer_type": "biography",
-    "confidence": 0.95
+  "intent": "person employment information",
+  "required_terms": [],
+  "phrases": ["rhys pacio"],
+  "optional_terms": [],
+  "context_terms": ["currently", "working"],
+  "exclude_terms": [],
+  "answer_type": "biography",
+  "confidence": 0.95
+}}
+
+EXAMPLE 5:
+
+Question:
+Give a small paragraph on who Rhys Pacio is and where he is currently working now.
+
+Good JSON:
+
+{{
+  "intent": "person employment information",
+  "required_terms": [],
+  "phrases": ["rhys pacio"],
+  "optional_terms": [],
+  "context_terms": ["currently", "working", "working now"],
+  "exclude_terms": [],
+  "answer_type": "biography",
+  "confidence": 0.95
 }}
 
 Now create the search plan for this question:
@@ -268,7 +409,10 @@ Question:
 {question}
 """
 
-    raw_plan = generate_local_response(prompt).strip()
+    raw_plan = generate_local_response(
+        prompt,
+        response_format=SEARCH_PLAN_SCHEMA,
+    ).strip()
 
     # Some local models wrap JSON in Markdown code fences.
     if raw_plan.startswith("```"):
@@ -305,8 +449,100 @@ Question:
         for key in SEARCH_PLAN_KEYS
     }
 
+    # ------------------------------------------------------------------
+    # Deterministic correction layer.
+    #
+    # The local model may occasionally place employment/question-context
+    # terms into the wrong category.
+    #
+    # Generic question words must NEVER participate in relevance
+    # scoring. Employment-context words describe WHAT information the
+    # user wants from a matching document and should not broaden Drive
+    # candidate retrieval.
+    # ------------------------------------------------------------------
+
+    employment_context_terms = {
+        "currently",
+        "currently working",
+        "working",
+        "working now",
+        "works",
+        "works now",
+        "current employer",
+        "employer",
+        "employment",
+        "job",
+        "where they work",
+        "where is the person working",
+    }
+
+    generic_question_terms = {
+        "where",
+        "who",
+        "what",
+        "when",
+        "which",
+        "why",
+        "how",
+        "paragraph",
+        "question",
+        "answer",
+    }
+
+    moved_context_terms = []
+
+    # First, clean generic question/formatting words out of EVERY
+    # category. They must never affect Drive retrieval or relevance
+    # scoring.
+    for key in SEARCH_PLAN_KEYS:
+        validated[key] = [
+            value
+            for value in validated[key]
+            if value not in generic_question_terms
+        ]
+
+    # Move employment-context terms out of optional_terms.
+    remaining_optional_terms = []
+
+    for value in validated["optional_terms"]:
+        if value in employment_context_terms:
+            moved_context_terms.append(value)
+            continue
+
+        remaining_optional_terms.append(value)
+
+    validated["optional_terms"] = remaining_optional_terms
+
+    # Also move employment-context terms from other retrieval-oriented
+    # categories into context_terms when the model put them there.
+    for key in (
+        "required_terms",
+        "phrases",
+    ):
+        remaining_values = []
+
+        for value in validated[key]:
+            if value in employment_context_terms:
+                moved_context_terms.append(value)
+                continue
+
+            remaining_values.append(value)
+
+        validated[key] = remaining_values
+
+    # If the model already placed employment terms in context_terms,
+    # keep them there. Add any terms that were moved from the other
+    # categories.
+    validated["context_terms"].extend(
+        moved_context_terms
+    )
+
+    # ------------------------------------------------------------------
     # Remove duplicates across categories.
+    #
     # The first category that contains a value keeps it.
+    # ------------------------------------------------------------------
+
     seen_values = set()
 
     for key in SEARCH_PLAN_KEYS:

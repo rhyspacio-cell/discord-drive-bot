@@ -3,7 +3,7 @@
 All notable changes to this project will be documented in this file.
 ---
 
-## [Unreleased] - 2026-09-24
+## [Unreleased] - 2026-09-25
 
 ### Changed
 
@@ -16,6 +16,8 @@ All notable changes to this project will be documented in this file.
 
 #### Google Drive
 
+* Added retries with truncated exponential backoff for transient Drive API and download failures.
+* Added Google Drive shortcut resolution, including clear handling for missing or inaccessible targets.
 * Added Drive full-text filtering before file extraction.
 * Added natural keyword search across file names and indexed file content.
 * Require all meaningful search terms and limit extraction attempts before ranking candidates by filename and content relevance.
@@ -25,6 +27,7 @@ All notable changes to this project will be documented in this file.
 * Added bounded metadata candidate retrieval before extraction.
 * Added content-aware relevance scoring and exact phrase/entity scoring.
 * Added extraction error, empty-result, score, candidate, and result diagnostics.
+* Added a factual per-request search audit covering candidates, analyzed files, files used, skipped files, extraction failures, and empty results.
 * Reduced the default candidate limit to 10 files and the total content limit to 30,000 characters.
 * Added configurable `MAX_DOWNLOAD_BYTES` protection for supported downloadable files.
 * Skip oversized downloadable files instead of failing the entire request.
@@ -36,11 +39,16 @@ All notable changes to this project will be documented in this file.
 #### Local AI
 
 * Replaced document reports with question answering grounded in matching Drive content.
+* Added Ollama JSON-schema responses for validated search plans.
+* Added relevance scores and primary-source guidance to answer prompts.
+* Added Ollama token and completion diagnostics for local troubleshooting.
 * Preserved prompt-injection protections for untrusted Drive documents.
 
 #### Configuration and Documentation
 
 * Load configuration from the project-root `.env` file.
+* Added explicit configuration for the OAuth callback host, port, state lifetime, database path, and Drive download limit.
+* Refined employment-question search planning so person names identify files while employment terms guide answer extraction.
 * Documented read-only Google Drive access and OAuth browser/session binding.
 * Documented process-local OAuth transaction storage and resource limits.
 
