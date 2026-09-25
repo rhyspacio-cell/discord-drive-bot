@@ -45,12 +45,18 @@ Discord User
      │   Encrypted Credentials
      │
      └── /ask-drive
-             │
-             ▼
-        Google Drive API
-             │
-             ▼
-       File Extraction
+               │
+               ▼
+          Ollama Search Planner
+               │
+               ▼
+          Google Drive API
+               │
+               ▼
+          Metadata Candidates
+               │
+               ▼
+            File Extraction
              │
              ▼
         Local Ollama
@@ -71,8 +77,8 @@ discord-drive-bot/
 └── modules/
     ├── config.py
     ├── drive.py
-    ├── llm.py
-    ├── oauth.py
+     ├── llm.py
+     ├── oauth.py
      ├── search.py
     └── storage.py
 ```
@@ -149,7 +155,7 @@ Handles communication with the locally running Ollama server and answers questio
 
 #### `modules/search.py`
 
-Uses Ollama to turn the user's search query and question into a constrained search plan. Python validates the plan and builds the Google Drive query.
+Uses Ollama to turn the user's current question into a constrained search plan. Python validates the plan and builds the Google Drive query. Previous Discord conversation is not used.
 
 ## Requirements
 
@@ -283,7 +289,7 @@ MAX_FILES=10
 MAX_DOWNLOAD_BYTES=10485760
 MAX_CHARS_PER_FILE=8000
 MAX_TOTAL_CHARS=30000
-MAX_SUMMARY_CHARS=5000
+MAX_ANSWER_CHARS=5000
 ```
 
 `MAX_DOWNLOAD_BYTES=10485760` sets a 10 MiB maximum raw download size for
@@ -343,7 +349,7 @@ Then:
 /ask-drive question:<question>
 ```
 
-will first ask Ollama to convert the question into a small structured search plan, then Python builds a safe Drive query from that plan. It searches accessible Drive files whose names or indexed full text match all required terms and phrases, limits extraction attempts to the top `MAX_FILES` metadata results, ranks those extracted candidates by filename and content relevance, and sends the best readable documents to Ollama. Optional plan terms influence ranking but do not allow the model to write Drive syntax. Drive matching is token-based, not arbitrary substring matching. The planner currently uses only the current question, not previous Discord conversation.
+will first ask Ollama to convert the question into a small structured search plan, then Python builds a safe broad candidate query from that plan. It searches accessible Drive files whose names or indexed full text match the candidate terms, retrieves up to `MAX_FILES * 3` metadata candidates, extracts at most `MAX_FILES` candidates, ranks extracted files by filename and content relevance, and sends the best readable documents to Ollama. Optional plan terms influence ranking but do not allow the model to write Drive syntax. Drive matching is token-based, not arbitrary substring matching. The planner currently uses only the current question, not previous Discord conversation.
 
 ## File Processing Limits
 

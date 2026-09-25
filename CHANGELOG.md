@@ -9,7 +9,7 @@ All notable changes to this project will be documented in this file.
 
 #### Discord Bot
 
-* Replaced `/summarize-drive` with `/ask-drive`.
+* Replaced the original Drive command with `/ask-drive`.
 * Simplified `/ask-drive` to accept one natural-language question.
 * Split long answers into Discord-safe ephemeral messages.
 * Clarified readable-file and skipped-oversized-file counts in responses.
@@ -22,6 +22,9 @@ All notable changes to this project will be documented in this file.
 * Added constrained Ollama search-plan interpretation before Drive retrieval.
 * Search planning now derives retrieval terms from the current question.
 * Added structured intent, phrase, context, exclusion, answer-type, and confidence fields.
+* Added bounded metadata candidate retrieval before extraction.
+* Added content-aware relevance scoring and exact phrase/entity scoring.
+* Added extraction error, empty-result, score, candidate, and result diagnostics.
 * Reduced the default candidate limit to 10 files and the total content limit to 30,000 characters.
 * Added configurable `MAX_DOWNLOAD_BYTES` protection for supported downloadable files.
 * Skip oversized downloadable files instead of failing the entire request.
@@ -32,7 +35,7 @@ All notable changes to this project will be documented in this file.
 
 #### Local AI
 
-* Replaced document summarization with question answering grounded in matching Drive content.
+* Replaced document reports with question answering grounded in matching Drive content.
 * Preserved prompt-injection protections for untrusted Drive documents.
 
 #### Configuration and Documentation
@@ -56,7 +59,7 @@ All notable changes to this project will be documented in this file.
 * Added Discord bot with slash-command support.
 * Added `/connect-drive` command.
 * Added `/drive-status` command.
-* Added `/summarize-drive` command.
+* Added the original Drive document command.
 * Added `/disconnect-drive` command.
 * Added ephemeral responses for user-specific Drive operations.
 
@@ -85,15 +88,15 @@ All notable changes to this project will be documented in this file.
 * Added local Ollama integration.
 * Added support for the `llama3.2:3b` model.
 * Added configurable Ollama base URL.
-* Added local document summarization.
-* Added configurable summary length limits.
+* Added local document analysis.
+* Added configurable response length limits.
 
 #### Content Protection
 
 * Added maximum file limits.
 * Added per-file character limits.
 * Added total character limits.
-* Added maximum summary length.
+* Added maximum answer length.
 * Added instructions to treat Google Drive document contents as untrusted data.
 * Added protection against blindly following instructions contained inside Drive documents.
 
@@ -131,7 +134,7 @@ All notable changes to this project will be documented in this file.
 * The bot is currently intended primarily for local/self-hosted use.
 * Ollama must be running locally.
 * Only selected Google Drive file formats are supported.
-* Large files are truncated before summarization.
+* Large files are truncated before question answering.
 * The OAuth callback must be correctly configured and reachable.
 * The OAuth connection flow should receive additional authorization hardening before production deployment.
 * Local model output depends on the selected Ollama model.

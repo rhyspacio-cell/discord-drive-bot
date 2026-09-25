@@ -3,7 +3,7 @@
 import json
 import re
 
-from modules.llm import LocalLLMError, generate_local_summary
+from modules.llm import LocalLLMError, generate_local_response
 
 
 SEARCH_PLAN_KEYS = (
@@ -268,7 +268,7 @@ Question:
 {question}
 """
 
-    raw_plan = generate_local_summary(prompt).strip()
+    raw_plan = generate_local_response(prompt).strip()
 
     # Some local models wrap JSON in Markdown code fences.
     if raw_plan.startswith("```"):

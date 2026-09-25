@@ -1,7 +1,7 @@
-"""Discord bot entrypoint for the Google Drive summarizer.
+"""Discord bot entrypoint for Google Drive question answering.
 
 The application is split into modules for configuration, encrypted token
-storage, Google OAuth, Drive extraction, and local LLM summarization.
+storage, Google OAuth, Drive extraction, and local LLM question answering.
 """
 
 import asyncio

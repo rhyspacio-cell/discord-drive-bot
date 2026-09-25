@@ -31,5 +31,5 @@ MAX_FILES = int(os.getenv("MAX_FILES", "10"))
 MAX_DOWNLOAD_BYTES = int(os.getenv("MAX_DOWNLOAD_BYTES", "10485760"))
 MAX_CHARS_PER_FILE = int(os.getenv("MAX_CHARS_PER_FILE", "8000"))
 MAX_TOTAL_CHARS = int(os.getenv("MAX_TOTAL_CHARS", "30000"))
-MAX_SUMMARY_CHARS = int(os.getenv("MAX_SUMMARY_CHARS", "5000"))
+MAX_ANSWER_CHARS = int(os.getenv("MAX_ANSWER_CHARS", "5000"))
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
