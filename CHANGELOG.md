@@ -3,7 +3,30 @@
 All notable changes to this project will be documented in this file.
 ---
 
-## [Unreleased] - 2026-09-25
+## [0.1.2] - 2026-09-28
+
+### Fixed
+
+#### Search Planning and Retrieval
+
+* Corrected explicit date-range aggregation classification so questions asking for multiple companies and dates across a range are treated as list/aggregation retrieval requests.
+* Preserved explicit `SEARCH: ...` anchors such as `SEARCH: COORDINATION LETTERS` while removing generic control words such as `that`, `entered`, `dates`, and `list` from retrieval terms.
+* Kept IPI and date-range filtering intact without converting single-company or focused-document questions into broad list queries.
+* Kept the approved broadened retrieval path active for explicit-date aggregation queries without globally raising `MAX_FILES`.
+
+#### Local AI Prompt Safety
+
+* Verified the answer-generation prompt still instructs the model to analyze every supplied document, treat the original user question as controlling, and treat relevance scores as metadata rather than authority rankings.
+* Added regression coverage for the real coordination-letter aggregation scenario and the focused-query guardrail.
+
+### Improved
+
+* Clarified the distinction between retrieval, extraction, prompt context inclusion, and the final LLM context when debugging list/aggregation questions.
+* Improved the project’s documentation of date-range list queries and the current retrieval safeguards.
+
+---
+
+## [0.1.1] - 2026-09-25
 
 ### Changed
 

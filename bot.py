@@ -38,8 +38,7 @@ The normal `/ask-drive` flow is:
         -> answer + file audit
         -> Discord response
 
-All user-facing command responses are ephemeral so that Drive-related
-information is only visible to the user who requested it.
+All user-facing command responses are visible in the channel.
 """
 
 import asyncio
@@ -417,7 +416,6 @@ async def connect_drive(
         f"{url}\n\n"
         "Only your Google account connection is associated "
         "with your Discord account.",
-        ephemeral=True,
     )
 
 
@@ -446,7 +444,6 @@ async def drive_status(
 
     await interaction.response.send_message(
         message,
-        ephemeral=True,
     )
 
 
@@ -471,7 +468,8 @@ async def ask_drive(
     4. Rank and filter the extracted documents.
     5. Send the selected documents to the local LLM.
     6. Format the generated answer together with the Drive audit.
-    7. Split the response into Discord-safe chunks and send them privately.
+    7. Post the original question and the answer as visible channel messages,
+       splitting long content into Discord-safe chunks when necessary.
 
     CPU-bound or blocking Drive/LLM operations are executed in worker
     threads so that they do not block Discord's asynchronous event loop.
@@ -481,7 +479,7 @@ async def ask_drive(
         question: Natural-language question to answer using Drive content.
     """
     await interaction.response.defer(
-        ephemeral=True,
+        ephemeral=False,
         thinking=True,
     )
 
@@ -518,6 +516,7 @@ async def ask_drive(
             answer_drive_question,
             question,
             documents,
+            search_plan,
         )
 
         # -----------------------------------------------------
@@ -531,9 +530,14 @@ async def ask_drive(
         )
 
         # -----------------------------------------------------
-        # 5. Discord limits message length, so split long
-        #    answers into multiple private messages.
+        # 5. Post the original question visibly in the channel,
+        #    then send the answer as ordinary persistent messages.
         # -----------------------------------------------------
+
+        await interaction.followup.send(
+            f"**Question:** {question}",
+            ephemeral=False,
+        )
 
         message_chunks = split_discord_message(
             message
@@ -542,7 +546,7 @@ async def ask_drive(
         for message_chunk in message_chunks:
             await interaction.followup.send(
                 message_chunk,
-                ephemeral=True,
+                ephemeral=False,
             )
 
     except LocalLLMError as exc:
@@ -556,7 +560,7 @@ async def ask_drive(
             "⚠️ I couldn't answer your Drive question "
             "because the local AI model is unavailable "
             f"or misconfigured.\n\n**Details:** {exc}",
-            ephemeral=True,
+            ephemeral=False,
         )
 
     except DriveError as exc:
@@ -569,7 +573,7 @@ async def ask_drive(
         await interaction.followup.send(
             "⚠️ I couldn't read your Google Drive.\n\n"
             f"**Details:** {exc}",
-            ephemeral=True,
+            ephemeral=False,
         )
 
     except Exception as exc:
@@ -585,7 +589,7 @@ async def ask_drive(
             "⚠️ An unexpected error occurred while "
             "processing your Drive. Check the bot's "
             "console logs for details.",
-            ephemeral=True,
+            ephemeral=False,
         )
 
 
@@ -603,7 +607,6 @@ async def disconnect_drive(
 
     await interaction.response.send_message(
         "Your stored Google Drive credentials have been deleted from this bot.",
-        ephemeral=True,
     )
 
 

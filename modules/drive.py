@@ -2,6 +2,7 @@ import io
 import random
 import re
 import time
+from datetime import date, timedelta
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -582,6 +583,123 @@ def get_search_terms(search_query: str):
     return terms
 
 
+def is_list_aggregation_query(search_plan):
+    """Return True only for explicit-date list/aggregation retrieval cases."""
+    if not isinstance(search_plan, dict):
+        return False
+
+    time_range = search_plan.get("time_range") or {}
+    has_explicit_range = bool(
+        time_range.get("from") is not None
+        or time_range.get("to") is not None
+    )
+
+    if not has_explicit_range:
+        return False
+
+    answer_type = str(search_plan.get("answer_type", "")).strip().lower()
+    intent = str(search_plan.get("intent", "")).strip().lower()
+
+    list_answer_types = {
+        "list",
+        "records",
+        "summary",
+        "table",
+        "aggregation",
+        "overview",
+        "timeline",
+        "dates",
+        "report",
+        "coordinate letters",
+        "coordination letters",
+        "letters",
+    }
+
+    if answer_type in list_answer_types:
+        return True
+
+    plan_values = []
+    for key in (
+        "required_terms",
+        "phrases",
+        "optional_terms",
+        "context_terms",
+    ):
+        values = search_plan.get(key, [])
+        if isinstance(values, list):
+            plan_values.extend(str(value) for value in values)
+
+    all_words = set(
+        re.findall(
+            r"[a-z0-9]+",
+            " ".join([intent, answer_type, *plan_values]),
+        )
+    )
+
+    aggregation_indicators = {
+        "list",
+        "listing",
+        "records",
+        "entries",
+        "dates",
+        "timeline",
+        "summary",
+        "overview",
+        "companies",
+        "events",
+        "all",
+    }
+
+    # Explicit date-range aggregation requests are multi-record questions.
+    # They are typically identifiable by plural/aggregate terms such as
+    # "companies" or "dates" even when the answer type is a narrow document
+    # category like "coordinate letters" rather than a literal "summary".
+    list_hits = aggregation_indicators & all_words
+
+    if not list_hits:
+        return False
+
+    if answer_type in {"document", "biography", "person", "company", "employee"}:
+        # Keep focused single-entity questions on the normal path even if the
+        # question contains a date range; they are not aggregation requests.
+        if list_hits & {"companies", "records", "entries", "dates", "timeline", "summary", "overview", "events", "all", "list", "listing"}:
+            return True
+        return False
+
+    return True
+
+
+def get_drive_candidate_limit():
+    """Return the existing bound for Drive metadata candidates."""
+    return max(
+        MAX_FILES * 3,
+        MAX_FILES,
+    )
+
+
+def get_document_limit_for_query(search_plan=None):
+    """Return the safe document cap for the current question type."""
+    if is_list_aggregation_query(search_plan):
+        return get_drive_candidate_limit()
+    return MAX_FILES
+
+
+def select_extraction_candidates(metadata_ranked, search_plan=None):
+    """Widen candidate selection for explicit-date list queries without removing MAX_FILES limits."""
+    if not metadata_ranked:
+        return []
+
+    candidate_limit = min(
+        len(metadata_ranked),
+        get_document_limit_for_query(search_plan),
+    )
+
+    return [
+        file_info
+        for _, file_info in metadata_ranked[:candidate_limit]
+    ]
+
+
 def build_drive_search_query(
     question: str,
     search_plan=None,
@@ -594,9 +712,62 @@ def build_drive_search_query(
     Python performs the more precise relevance ranking afterward.
     """
 
+    def validate_time_range(time_range):
+        """Validate and return a normalized time range for Drive filtering."""
+        if time_range is None:
+            return None
+
+        if not isinstance(time_range, dict):
+            raise DriveError(
+                "The search plan contains an invalid time range."
+            )
+
+        start_raw = time_range.get("from")
+        end_raw = time_range.get("to")
+
+        if start_raw is not None and not isinstance(start_raw, str):
+            raise DriveError(
+                "The search plan contains an invalid time range."
+            )
+
+        if end_raw is not None and not isinstance(end_raw, str):
+            raise DriveError(
+                "The search plan contains an invalid time range."
+            )
+
+        start = None
+        end = None
+
+        if start_raw:
+            try:
+                start = date.fromisoformat(start_raw)
+            except ValueError as exc:
+                raise DriveError(
+                    "The search plan contains an invalid time range."
+                ) from exc
+
+        if end_raw:
+            try:
+                end = date.fromisoformat(end_raw)
+            except ValueError as exc:
+                raise DriveError(
+                    "The search plan contains an invalid time range."
+                ) from exc
+
+        if start is not None and end is not None and start > end:
+            raise DriveError(
+                "The search plan contains an invalid time range."
+            )
+
+        return {
+            "from": start,
+            "to": end,
+        }
+
     if search_plan is None:
         terms = get_search_terms(question)
         excludes = []
+        time_range = None
 
     else:
         required_terms = search_plan.get(
@@ -617,6 +788,10 @@ def build_drive_search_query(
         excludes = search_plan.get(
             "exclude_terms",
             [],
+        )
+
+        time_range = validate_time_range(
+            search_plan.get("time_range")
         )
 
         all_positive_values = (
@@ -669,10 +844,14 @@ def build_drive_search_query(
 
         # Break phrases into searchable words.
         for phrase in phrases:
-            phrase_terms = re.findall(
-                r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)*",
-                phrase,
-            )
+            phrase_terms = [
+                term
+                for term in re.findall(
+                    r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)*",
+                    phrase,
+                )
+                if term.lower() not in {"that", "entered", "date", "dates", "list", "lists"}
+            ]
 
             terms.extend(
                 phrase_terms
@@ -738,8 +917,24 @@ def build_drive_search_query(
 
     query_parts = [
         base,
-        f"({positive_query})",
     ]
+
+    if time_range and time_range.get("from"):
+        from_date = time_range["from"]
+        query_parts.append(
+            f"modifiedTime >= '{from_date.isoformat()}T00:00:00'"
+        )
+
+    if time_range and time_range.get("to"):
+        end_date = time_range["to"]
+        upper_bound = end_date + timedelta(days=1)
+        query_parts.append(
+            f"modifiedTime < '{upper_bound.isoformat()}T00:00:00'"
+        )
+
+    query_parts.append(
+        f"({positive_query})",
+    )
 
     if exclude_clauses:
         query_parts.extend(
@@ -829,10 +1024,12 @@ def score_file_relevance(
 
         for phrase in phrases:
             phrase_terms.extend(
-                re.findall(
+                term
+                for term in re.findall(
                     r"[a-z0-9]+",
                     phrase,
                 )
+                if term not in {"that", "entered", "date", "dates", "list", "lists"}
             )
 
         search_terms = list(
@@ -1007,10 +1204,7 @@ def _collect_documents_for_query(
 
     page_token = None
 
-    candidate_limit = max(
-        MAX_FILES * 3,
-        MAX_FILES,
-    )
+    candidate_limit = get_drive_candidate_limit()
 
     while len(candidates) < candidate_limit:
 
@@ -1090,10 +1284,10 @@ def _collect_documents_for_query(
         reverse=True,
     )
 
-    extraction_candidates = [
-        file_info
-        for _, file_info in metadata_ranked[:MAX_FILES]
-    ]
+    extraction_candidates = select_extraction_candidates(
+        metadata_ranked,
+        search_plan,
+    )
 
     print(
         "[EXTRACTION CANDIDATES]",
@@ -1521,8 +1715,10 @@ def _collect_documents_for_query(
     documents = []
     total_characters = 0
 
-    # Remove documents that are substantially less relevant
-    # than the best matching document.
+    # Remove documents that are substantially less relevant than
+    # the best matching document, but preserve completeness for
+    # explicit-date list/aggregation retrieval where the user is asking
+    # for the complete set across the requested range.
     if extracted_documents:
 
         highest_score = (
@@ -1532,10 +1728,13 @@ def _collect_documents_for_query(
             )
         )
 
-        minimum_score = max(
-            1,
-            highest_score - 5,
-        )
+        if is_list_aggregation_query(search_plan):
+            minimum_score = 1
+        else:
+            minimum_score = max(
+                1,
+                highest_score - 5,
+            )
 
         extracted_documents = [
             document
@@ -1552,6 +1751,8 @@ def _collect_documents_for_query(
             highest_score,
             "minimum_score=",
             minimum_score,
+            "list_aggregation=",
+            is_list_aggregation_query(search_plan),
             "remaining=",
             [
                 {
@@ -1562,9 +1763,11 @@ def _collect_documents_for_query(
             ],
         )
 
+    document_limit = get_document_limit_for_query(search_plan)
+
     for document in extracted_documents:
 
-        if len(documents) >= MAX_FILES:
+        if len(documents) >= document_limit:
             break
 
         text = document["text"]
