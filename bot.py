@@ -471,7 +471,8 @@ async def ask_drive(
     4. Rank and filter the extracted documents.
     5. Send the selected documents to the local LLM.
     6. Format the generated answer together with the Drive audit.
-    7. Split the response into Discord-safe chunks and send them privately.
+    7. Post the original question and the answer as visible channel messages,
+       splitting long content into Discord-safe chunks when necessary.
 
     CPU-bound or blocking Drive/LLM operations are executed in worker
     threads so that they do not block Discord's asynchronous event loop.
@@ -518,6 +519,7 @@ async def ask_drive(
             answer_drive_question,
             question,
             documents,
+            search_plan,
         )
 
         # -----------------------------------------------------
@@ -531,9 +533,14 @@ async def ask_drive(
         )
 
         # -----------------------------------------------------
-        # 5. Discord limits message length, so split long
-        #    answers into multiple private messages.
+        # 5. Post the original question visibly in the channel,
+        #    then send the answer as ordinary persistent messages.
         # -----------------------------------------------------
+
+        await interaction.followup.send(
+            f"**Question:** {question}",
+            ephemeral=False,
+        )
 
         message_chunks = split_discord_message(
             message
@@ -542,7 +549,7 @@ async def ask_drive(
         for message_chunk in message_chunks:
             await interaction.followup.send(
                 message_chunk,
-                ephemeral=True,
+                ephemeral=False,
             )
 
     except LocalLLMError as exc:

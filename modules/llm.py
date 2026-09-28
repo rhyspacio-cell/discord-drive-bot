@@ -7,6 +7,7 @@ from modules.config import (
     MAX_ANSWER_CHARS,
     MAX_TOTAL_CHARS,
 )
+from modules.drive import is_list_aggregation_query
 
 
 class LocalLLMError(RuntimeError):
@@ -84,11 +85,13 @@ def generate_local_response(prompt: str, response_format=None) -> str:
     return text[:MAX_ANSWER_CHARS]
 
 
-def answer_drive_question(question: str, documents):
+def answer_drive_question(question: str, documents, search_plan=None):
     """Answer a question using extracted Google Drive contents."""
 
     if not documents:
         return "I couldn't find any readable files matching that query."
+
+    list_aggregation = is_list_aggregation_query(search_plan)
 
     source = "\n".join(
         (
@@ -115,36 +118,55 @@ def answer_drive_question(question: str, documents):
         ],
     )
 
+    list_aggregation = is_list_aggregation_query(search_plan)
+
+    aggregation_guidance = (
+        """
+For explicit date-range list/aggregation questions, synthesize the answer
+across all supplied documents. Each company/date claim must be supported by
+one or more of the documents supplied here. Do not infer an entry merely
+because a company name appears in a document. Distinguish between a company
+being mentioned, a company entering the subject, and an event or date that
+appears in a document without establishing the actual entry.
+
+If the supplied documents disagree, identify the disagreement and attribute it
+to the relevant documents rather than silently preferring the highest-scoring
+one.
+"""
+        if list_aggregation
+        else ""
+    )
+
     prompt = f"""
 You are answering a question about one person's
 Google Drive for that person.
 
 Answer the user's question directly and concisely.
 
-Use factual descriptions supported by the documents.
-Do not use subjective or evaluative labels such as
-"expert", "highly skilled", "outstanding", or "leading"
-unless the document explicitly uses that wording.
+Original user question discipline:
+- Original user question is the controlling instruction.
+- Answer only the question that was actually asked.
+- Use the original user question as the sole guide for what information is relevant.
+- Do not reinterpret the task based on filename, document order, or relevance score.
+- Do not switch to a different subject merely because another document mentions it.
+- If the user asks about Rhys Pacio, answer about Rhys Pacio; do not answer a different question just because a different document has a higher score.
+
+Analyze every supplied document.
+Relevance scores are retrieval metadata only. They are not authority rankings
+and must not be used to decide that one supplied document is correct or that
+another supplied document should be ignored.
+
+Do not treat the highest-scoring document as a primary source or as more
+authoritative than the other supplied documents.
+Do not stop reasoning after the first document that appears relevant.
+Use evidence from any supplied document that helps answer the question.
 
 Use only the file contents provided below as evidence.
 If the files do not contain enough information, say so clearly.
+Do not invent facts, relationships, dates, names, or conclusions that are not
+supported by the supplied documents.
 
-The files are ordered by relevance score, from highest to lowest.
-
-The file with the highest relevance score is the PRIMARY SOURCE.
-Use the PRIMARY SOURCE first when answering the question.
-
-Do not replace the primary source with a lower-scoring file
-just because the lower-scoring file contains more text or discusses
-a related organization, company, program, or topic.
-
-For questions asking who a person is, their biography, education,
-employment, or current work, prioritize personal documents such
-as resumes, CVs, profiles, or biographies over organizational
-documents that merely mention the person.
-
-Only use lower-scoring files when the primary source does not
-contain enough information to answer the question.
+{aggregation_guidance}
 
 User question:
 {question}
