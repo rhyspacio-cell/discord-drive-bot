@@ -13,6 +13,10 @@ def _coordination_letter_subject_supported(text, subject, subject_type):
         label = re.sub(r"[_\s]+", " ", parts[0].casefold().strip())
         if label in role_labels and _contains_phrase(parts[1], subject):
             return True
+    return _explicit_activity_subject_relationship(text, subject)
+
+
+def _explicit_activity_subject_relationship(text, subject):
     subject_pattern = re.escape(subject)
     return bool(
         re.search(
@@ -43,7 +47,6 @@ PERSON_SUBJECT_ROLE_LABELS = {
     "individual",
     "client",
     "participant",
-    "project manager",
     "responsible person",
     "activity owner",
     "assigned to",
@@ -62,6 +65,7 @@ NON_SUBJECT_ROLE_LABELS = {
     "author",
     "approver",
     "supervisor",
+    "project manager",
     "witness",
     "signatory",
     "reviewer",
@@ -314,13 +318,77 @@ def _document_type_supported(text, document_type):
     return _contains_phrase(text, document_type)
 
 
-def _subject_and_field_are_bound(paragraph, subject, requested_field):
+def _has_other_person_subject(paragraph, subject):
+    for line in paragraph.splitlines():
+        parts = re.split(r"\s*(?:\||:|\- )\s*", line, maxsplit=1)
+        if len(parts) != 2:
+            continue
+        label = re.sub(r"[_\s]+", " ", parts[0].strip().casefold())
+        if label in PERSON_SUBJECT_ROLE_LABELS and not _contains_phrase(
+            parts[1],
+            subject,
+        ):
+            return True
+    return False
+
+
+def _company_activity_relation_supported(text, subject):
+    subject_pattern = re.escape(subject)
+    activity_noun = r"(?:activity|event|task|inspection|sampling|maintenance|training)"
+    return bool(
+        re.search(
+            rf"\b{activity_noun}\s+(?:is\s+)?for\s+{subject_pattern}\b",
+            text,
+            re.IGNORECASE,
+        )
+        or re.search(
+            rf"\b{subject_pattern}\b[^.;\n]{{0,160}}\b(?:will|plans?\s+to|is\s+scheduled\s+to|conduct\w*|perform\w*)\b",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _company_date_binding_conflicts(text, subject, subject_type, requested_field):
+    return bool(
+        subject_type == "company"
+        and requested_field in {"date", "planned_activity_date", "entry_date"}
+        and _has_other_person_subject(text, subject)
+        and not _company_activity_relation_supported(text, subject)
+    )
+
+
+def _subject_and_field_are_bound(
+    paragraph,
+    subject,
+    requested_field,
+    subject_type=None,
+):
     """Require that the subject and the requested field are tied to the same local claim window."""
     if not subject or not requested_field or requested_field not in {
         "date",
         "planned_activity_date",
         "entry_date",
     }:
+        return True
+    if (
+        subject_type == "company"
+        and _has_other_person_subject(paragraph, subject)
+        and not _company_activity_relation_supported(paragraph, subject)
+    ):
+        return False
+    if (
+        _subject_supported(
+            paragraph,
+            subject,
+            requested_field,
+            subject_type=subject_type,
+            document_type="Coordination Letter",
+        )
+        and _explicit_activity_subject_relationship(paragraph, subject)
+        and not _has_other_person_subject(paragraph, subject)
+        and _field_supported(paragraph, requested_field) is True
+    ):
         return True
 
     sentence_segments = [
@@ -411,6 +479,13 @@ def _relationship_supported(text, constraints, field_match):
 
     for paragraph in paragraphs:
         sentences = re.split(r"(?<=[.!?])\s+", paragraph)
+        if subject and _company_date_binding_conflicts(
+            paragraph,
+            subject,
+            constraints.get("subject_type"),
+            requested_field,
+        ):
+            continue
         for sentence in sentences:
             subject_ok = not subject or _subject_supported(
                 sentence,
@@ -420,7 +495,14 @@ def _relationship_supported(text, constraints, field_match):
                 constraints.get("subject_type"),
                 constraints.get("document_type"),
             )
-            activity_ok = not activity or _contains_concept(sentence, activity)
+            activity_ok = (
+                not activity
+                or (
+                    requested_field == "activity"
+                    and _field_supported(sentence, requested_field) is True
+                )
+                or _contains_concept(sentence, activity)
+            )
             field_ok = (
                 field_match is not False
                 and _field_supported(sentence, requested_field) is not False
@@ -428,37 +510,24 @@ def _relationship_supported(text, constraints, field_match):
             if subject_ok and activity_ok and field_ok and len(sentence) <= 1200:
                 return True
 
-        structured_subject_labels = PERSON_SUBJECT_ROLE_LABELS | (
-            ORGANIZATION_SUBJECT_ROLE_LABELS
-            if constraints.get("subject_type") == "company"
-            else set()
-        )
-        if constraints.get("document_type") == "Coordination Letter":
-            structured_subject_labels = structured_subject_labels | {"contact"}
-        structured_subject_pattern = "|".join(
-            re.escape(label)
-            for label in sorted(structured_subject_labels, key=len, reverse=True)
-        )
         structured_subject = (
             not subject
-            or bool(
-                re.search(
-                    rf"\b(?:{structured_subject_pattern})\s*[:\-]",
-                    paragraph,
-                    re.IGNORECASE,
-                )
-                    and _subject_supported(
-                        paragraph,
-                        subject,
-                        requested_field,
-                        constraints.get("requested_relationship"),
-                        constraints.get("subject_type"),
-                        constraints.get("document_type"),
-                    )
+            or _subject_supported(
+                paragraph,
+                subject,
+                requested_field,
+                constraints.get("requested_relationship"),
+                constraints.get("subject_type"),
+                constraints.get("document_type"),
             )
         )
         structured_activity = (
             not activity
+            or (
+                requested_field == "activity"
+                and bool(re.search(r"\b(?:planned\s+)?activity\s*[:\-]", paragraph, re.IGNORECASE))
+                and _field_supported(paragraph, requested_field) is True
+            )
             or (
                 bool(re.search(r"\b(?:activity|event|task)\s*[:\-]", paragraph, re.IGNORECASE))
                 and _contains_concept(paragraph, activity)
@@ -481,8 +550,22 @@ def _relationship_supported(text, constraints, field_match):
                 paragraph,
                 subject,
                 requested_field,
+                constraints.get("subject_type"),
             )
         if structured_subject and structured_activity and structured_field:
+            return True
+        if (
+            structured_subject
+            and subject
+            and requested_field in {"date", "planned_activity_date", "entry_date"}
+            and field_match is True
+            and _subject_and_field_are_bound(
+                paragraph,
+                subject,
+                requested_field,
+                constraints.get("subject_type"),
+            )
+        ):
             return True
 
         if (
@@ -493,23 +576,6 @@ def _relationship_supported(text, constraints, field_match):
             and _field_supported(paragraph, requested_field) is True
         ):
             return True
-
-    if (
-        constraints.get("document_type") == "Coordination Letter"
-        and subject
-        and _contains_phrase(text, constraints["document_type"])
-        and _coordination_letter_subject_supported(
-            text,
-            subject,
-            constraints.get("subject_type"),
-        )
-    ):
-        return any(
-            (not activity or _contains_concept(sentence, activity))
-            and _field_supported(sentence, requested_field) is not False
-            for paragraph in paragraphs
-            for sentence in re.split(r"(?<=[.!?])\s+", paragraph)
-        )
 
     return False
 
@@ -596,17 +662,16 @@ def _subject_supported(
             subject,
             requested_relationship,
         )
-    coordination_contact = document_type == "Coordination Letter"
+    explicit_activity_relationship = _explicit_activity_subject_relationship(
+        text,
+        subject,
+    )
     subject_roles = PERSON_SUBJECT_ROLE_LABELS | (
         ORGANIZATION_SUBJECT_ROLE_LABELS if subject_type == "company" else set()
     )
-    if coordination_contact:
-        subject_roles = subject_roles | {"contact"}
     other_roles = NON_SUBJECT_ROLE_LABELS | (
         ORGANIZATION_SUBJECT_ROLE_LABELS if subject_type != "company" else set()
     )
-    if coordination_contact:
-        other_roles = other_roles - {"contact"}
     role_values = {"subject": [], "other": []}
     for line in text.splitlines():
         parts = re.split(r"\s*(?:\||:)\s*", line, maxsplit=1)
@@ -647,11 +712,11 @@ def _subject_supported(
     subject_is_bound = subject_is_bound or subject_field_match
     subject_is_other_role = subject_is_other_role or other_field_match
     if subject_is_other_role and role_values["subject"] and not subject_is_bound:
-        return False
+        return explicit_activity_relationship
     if subject_is_other_role and not subject_is_bound:
-        return False
+        return explicit_activity_relationship
     if role_values["subject"] and not subject_is_bound:
-        return False
+        return explicit_activity_relationship
     return True
 
 
@@ -735,6 +800,8 @@ def assess_candidate(question, candidate, search_plan=None):
         )
     )
     activity_match = None if not activity else _contains_concept(text, activity)
+    if requested_field == "activity" and activity_match is False:
+        activity_match = _field_supported(text, requested_field) is True
     organization_match = (
         subject_match
         if constraints.get("subject_type") == "company"

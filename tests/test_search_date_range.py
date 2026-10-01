@@ -93,6 +93,14 @@ def test_query_constraints_preserve_entity_and_activity_across_paraphrases():
     assert all(item["document_type"] is None for item in constraints)
 
 
+def test_query_constraints_treat_someone_named_as_the_requested_subject():
+    question = "What is the planned activity date for someone named John Smith?"
+    constraints = extract_query_constraints(question)
+
+    assert constraints["subject_entity"] == "John Smith"
+    assert constraints["requested_field"] == "planned_activity_date"
+
+
 def test_activity_date_paraphrases_normalize_to_same_subject_and_field():
     questions = [
         "What is the planned activity date for John Smith?",

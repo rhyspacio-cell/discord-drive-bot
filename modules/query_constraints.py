@@ -119,26 +119,73 @@ ACTIVITY_EXCLUSIONS = {
 }
 
 
+def _candidate_subject_names(question):
+    candidates = []
+    for match in re.finditer(r"(?:[A-Z][A-Za-z0-9&.'-]*)(?:\s+(?:[A-Z][A-Za-z0-9&.'-]*)){0,3}", question):
+        raw = match.group(0).strip()
+        possessive = bool(re.search(r"['’]s\s*$", raw, flags=re.IGNORECASE))
+        candidate = re.sub(r"['’]s\s*$", "", raw, flags=re.IGNORECASE)
+        candidate = re.sub(r"\s+", " ", candidate).strip()
+        if not candidate:
+            continue
+        if candidate.casefold() in ENTITY_EXCLUSIONS:
+            continue
+        if candidate.split()[0].casefold() in ENTITY_EXCLUSIONS:
+            continue
+        candidates.append((candidate, match.start(), match.end(), possessive))
+    return candidates
+
+
 def _find_subject(question):
+    question = question if isinstance(question, str) else ""
     patterns = (
-        rf"(?P<entity>{PROPER_NAME})['’]s\b",
-        rf"\b(?i:for|about|regarding|concerning|involving|associated\s+with|related\s+to)\s+(?P<entity>{PROPER_NAME})\b",
-        rf"\b(?i:represent|authorized\s+to\s+represent|authorize\w*\s+to\s+represent)\s+(?P<entity>{PROPER_NAME})\b",
+        rf"\b(?:a|an|the)?\s*(?:someone|person|individual)\s+named\s+(?P<entity>{PROPER_NAME})\b",
+        rf"\b(?:for|about|regarding|concerning|involving|associated\s+with|related\s+to)\s+(?:a|an|the)?\s*(?:someone|person|individual)\s+named\s+(?P<entity>{PROPER_NAME})\b",
+        rf"\b(?:for|about|regarding|concerning|involving|associated\s+with|related\s+to)\s+(?P<entity>{PROPER_NAME})\b",
+        rf"\b(?:represent|authorized\s+to\s+represent|authorize\w*\s+to\s+represent)\s+(?P<entity>{PROPER_NAME})\b",
         rf"\b(?P<entity>{PROPER_NAME})\s+(?:(?:is|was|has\s+been)\s+)?authorized\s+to\s+(?:operate|use|access|receive|bring|carry|perform|transport)\b",
-        rf"\b(?i:who\s+is|where\s+is|what\s+is|when\s+is)\s+(?P<entity>{PROPER_NAME})\b",
     )
     for pattern in patterns:
-        match = re.search(pattern, question)
+        match = re.search(pattern, question, flags=re.IGNORECASE)
         if not match:
             continue
-        entity = re.sub(r"\s+", " ", match.group("entity")).strip()
+        entity = match.group("entity").strip()
+        entity = re.sub(r"['’]s\s*$", "", entity, flags=re.IGNORECASE)
+        entity = re.sub(r"\s+", " ", entity).strip()
+        if not entity:
+            continue
         if entity.casefold() in ENTITY_EXCLUSIONS:
             continue
         if entity.split()[0].casefold() in ENTITY_EXCLUSIONS:
             continue
         return entity, match.span("entity"), match.group(0).endswith(("'s", "’s"))
 
-    return None, None, False
+    candidates = _candidate_subject_names(question)
+    if not candidates:
+        return None, None, False
+    candidate, start, end, possessive = candidates[-1]
+    if re.search(r"\b(?:involving|for|about|regarding|concerning|related\s+to|associated\s+with)\b", question, flags=re.IGNORECASE):
+        stripped = re.sub(r"\b(?:involving|for|about|regarding|concerning|related\s+to|associated\s+with)\b.*", "", question, flags=re.IGNORECASE)
+        if stripped and re.search(r"\b[A-Z][A-Za-z0-9&.'-]*(?:\s+[A-Z][A-Za-z0-9&.'-]*){0,3}\b", stripped):
+            last_name = re.findall(r"\b[A-Z][A-Za-z0-9&.'-]*(?:\s+[A-Z][A-Za-z0-9&.'-]*){0,3}\b", stripped)[-1]
+            if last_name and last_name.lower() != 'when':
+                candidate = re.sub(r"['’]s\s*$", "", last_name).strip()
+                start = question.rfind(candidate)
+                end = start + len(candidate)
+                possessive = False
+    return candidate, (start, end), possessive
+
+
+def _strip_named_subject_anchor(text):
+    """Drop phrases like 'for someone named' so they are not mistaken for activity text."""
+    if not isinstance(text, str):
+        return text
+    return re.sub(
+        r"(?:\b(?:for|about|regarding|concerning|involving|associated\s+with|related\s+to)\b\s*)?(?:a|an|the)?\s*(?:someone|person|individual)\s+named\s*$",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
 
 
 def _clean_activity(value):
@@ -159,7 +206,7 @@ def _clean_activity(value):
 
 def _extract_activity(question, entity_span, possessive):
     if entity_span:
-        before = question[:entity_span[0]]
+        before = _strip_named_subject_anchor(question[:entity_span[0]])
         after = question[entity_span[1]:]
         if possessive:
             after = re.sub(r"^['’]s\b", " ", after)
@@ -181,7 +228,8 @@ def _extract_activity(question, entity_span, possessive):
 def extract_query_constraints(question):
     """Preserve explicit subject, activity, and requested-field constraints."""
     question = question if isinstance(question, str) else ""
-    subject, subject_span, possessive = _find_subject(question)
+    subject_question = re.sub(r"\bSEARCH\s*:\s*.*$", "", question, flags=re.IGNORECASE).strip()
+    subject, subject_span, possessive = _find_subject(subject_question)
     normalized = question.casefold()
 
     if re.search(r"\b(?:authorized|authorization|authorize)\b", normalized):
@@ -229,7 +277,7 @@ def extract_query_constraints(question):
         activity = "project meeting"
     else:
         activity = (
-            _extract_activity(question, subject_span, possessive)
+            _extract_activity(subject_question, subject_span, possessive)
             if scheduling_context and not (aggregate_query and not possessive)
             else None
         )

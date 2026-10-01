@@ -121,7 +121,7 @@ def test_unseen_project_meeting_document_uses_generic_evidence_path():
     assert result.assessments[candidate["name"]].eligible
 
 
-def test_project_manager_report_binds_equipment_inspection_and_date():
+def test_project_manager_role_does_not_bind_equipment_inspection_date():
     question = "What date is the equipment inspection planned for John Smith?"
     plan = {"query_constraints": extract_query_constraints(question)}
     candidate = {
@@ -140,8 +140,75 @@ def test_project_manager_report_binds_equipment_inspection_and_date():
         candidate["name"]
     ]
 
-    assert assessment.subject_match
+    assert assessment.subject_match is False
     assert assessment.activity_match
+    assert assessment.requested_field_match
+    assert not assessment.relationship_supported
+    assert not assessment.eligible
+
+
+def test_project_risk_assessment_rejects_representative_activity_date():
+    question = (
+        "What is planned activity date for John Smith according to "
+        "project risk assessment?"
+    )
+    candidate = {
+        "name": "project_risk_assessment.docx",
+        "text": (
+            "PROJECT RISK ASSESSMENT\n"
+            "Representative: John Smith\n"
+            "Planned Activity Date: October 10, 2026"
+        ),
+    }
+
+    assessment = assess_candidate(
+        question,
+        candidate,
+        {"query_constraints": extract_query_constraints(question)},
+    )
+
+    assert not assessment.eligible
+
+
+def test_company_field_does_not_bind_personal_activity_date():
+    question = "What is Alpha Marine Services' planned activity date?"
+    candidate = {
+        "name": "activity_record.docx",
+        "text": (
+            "Person: John Smith\n"
+            "Company: Alpha Marine Services\n"
+            "Planned Activity Date: October 10, 2026"
+        ),
+    }
+
+    assessment = assess_candidate(
+        question,
+        candidate,
+        {"query_constraints": extract_query_constraints(question)},
+    )
+
+    assert not assessment.eligible
+
+
+def test_explicit_company_activity_statement_binds_company_date():
+    question = "What is Alpha Marine Services' planned activity date?"
+    candidate = {
+        "name": "company_activity_record.docx",
+        "text": (
+            "Person: John Smith\n"
+            "Company: Alpha Marine Services\n"
+            "Alpha Marine Services will conduct an equipment inspection on "
+            "October 10, 2026."
+        ),
+    }
+
+    assessment = assess_candidate(
+        question,
+        candidate,
+        {"query_constraints": extract_query_constraints(question)},
+    )
+
+    assert assessment.subject_match
     assert assessment.requested_field_match
     assert assessment.relationship_supported
     assert assessment.eligible
@@ -288,6 +355,168 @@ def test_inline_company_representative_is_not_activity_subject():
     assert EvidenceRejectionReason.SUBJECT_MISMATCH in assessment.rejection_reasons
 
 
+def test_explicit_coordination_statement_and_structured_fields_bind_subject_and_date():
+    question = "What is John Smith's planned activity date in the Coordination Letter?"
+    plan = {"query_constraints": extract_query_constraints(question)}
+    candidate = {
+        "name": "coordination_letter_test.docx",
+        "text": (
+            "COORDINATION LETTER\n"
+            "This letter coordinates the planned activity for John Smith.\n"
+            "Company: Alpha Marine Services\n"
+            "Location: Cebu Port\n"
+            "Planned Activity Date: October 10, 2026\n"
+            "Company Representative: Maria Santos"
+        ),
+    }
+
+    assessment = validate_candidates(question, [candidate], plan).assessments[
+        candidate["name"]
+    ]
+
+    assert assessment.subject_match is True
+    assert assessment.requested_field_match is True
+    assert assessment.relationship_supported is True
+    assert assessment.eligible
+
+
+def test_explicit_coordination_statement_and_structured_fields_bind_activity_name():
+    question = "What activity is being coordinated for John Smith?"
+    plan = {"query_constraints": extract_query_constraints(question)}
+    candidate = {
+        "name": "coordination_letter_test.docx",
+        "text": (
+            "COORDINATION LETTER\n"
+            "This letter coordinates the planned activity for John Smith.\n"
+            "Company: Alpha Marine Services\n"
+            "Location: Cebu Port\n"
+            "Planned Activity: Equipment Inspection\n"
+            "Planned Activity Date: October 10, 2026\n"
+            "Company Representative: Maria Santos"
+        ),
+    }
+
+    assessment = validate_candidates(question, [candidate], plan).assessments[
+        candidate["name"]
+    ]
+
+    assert assessment.subject_match is True
+    assert assessment.activity_match is True
+    assert assessment.relationship_supported is True
+    assert assessment.eligible
+
+
+def test_coordination_company_does_not_inherit_person_activity_date():
+    question = (
+        "What is the planned activity date for Alpha Marine Services "
+        "in the Coordination Letter?"
+    )
+    candidate = {
+        "name": "coordination_letter_test.docx",
+        "text": (
+            "COORDINATION LETTER\n"
+            "Person: John Smith\n"
+            "Company: Alpha Marine Services\n"
+            "Planned Activity Date: October 10, 2026"
+        ),
+    }
+
+    assessment = assess_candidate(
+        question,
+        candidate,
+        {"query_constraints": extract_query_constraints(question)},
+    )
+
+    assert not assessment.eligible
+    assert not assessment.relationship_supported
+
+
+def test_coordination_contact_role_does_not_bind_activity_date():
+    question = "What is Maria Santos's planned activity date in the Coordination Letter?"
+    candidate = {
+        "name": "coordination_letter_test.docx",
+        "text": (
+            "COORDINATION LETTER\n"
+            "Contact: Maria Santos\n"
+            "Planned Activity Date: October 10, 2026"
+        ),
+    }
+
+    assessment = assess_candidate(
+        question,
+        candidate,
+        {"query_constraints": extract_query_constraints(question)},
+    )
+
+    assert not assessment.eligible
+    assert assessment.subject_match is False
+
+
+def test_coordination_subject_does_not_inherit_another_persons_date():
+    question = "What is John Smith's planned activity date in the Coordination Letter?"
+    candidate = {
+        "name": "coordination_letter_test.docx",
+        "text": (
+            "COORDINATION LETTER\n"
+            "This letter coordinates the planned activity for John Smith.\n"
+            "Person: Maria Santos\n"
+            "Planned Activity Date: November 12, 2026"
+        ),
+    }
+
+    assessment = assess_candidate(
+        question,
+        candidate,
+        {"query_constraints": extract_query_constraints(question)},
+    )
+
+    assert not assessment.eligible
+    assert not assessment.relationship_supported
+
+
+def test_explicit_coordination_relationship_binds_subject_date_without_fallback():
+    question = "What is John Smith's planned activity date in the Coordination Letter?"
+    candidate = {
+        "name": "coordination_letter_test.docx",
+        "text": (
+            "COORDINATION LETTER\n"
+            "This letter coordinates the planned activity for John Smith.\n"
+            "Planned Activity Date: October 10, 2026."
+        ),
+    }
+
+    assessment = assess_candidate(
+        question,
+        candidate,
+        {"query_constraints": extract_query_constraints(question)},
+    )
+
+    assert assessment.eligible
+    assert assessment.relationship_supported
+    assert assessment.evidence_span == candidate["text"]
+
+
+def test_explicit_company_activity_relationship_binds_company_date():
+    question = "What is the planned activity date for Alpha Marine Services?"
+    candidate = {
+        "name": "coordination_letter_test.docx",
+        "text": (
+            "COORDINATION LETTER\n"
+            "Alpha Marine Services will conduct the equipment inspection.\n"
+            "Planned Activity Date: October 10, 2026."
+        ),
+    }
+
+    assessment = assess_candidate(
+        question,
+        candidate,
+        {"query_constraints": extract_query_constraints(question)},
+    )
+
+    assert assessment.eligible
+    assert assessment.relationship_supported
+
+
 def test_company_date_must_bind_to_requested_company():
     question = "What is the planned activity date for Alpha Marine Services?"
     plan = {"query_constraints": extract_query_constraints(question)}
@@ -330,13 +559,13 @@ def test_coordination_evidence_binds_person_and_excludes_other_letters():
             "name": "Coordination_Letter_John_Smith.docx",
             "candidate_id": "coord-john",
             "modifiedTime": "2026-09-29",
-            "text": "COORDINATION LETTER\nContact: John Smith.\nWe would like to inform you that Alpha Marine Services will be conducting an equipment inspection on October 10, 2026.",
+            "text": "COORDINATION LETTER\nContact: John Smith.\nThis letter coordinates the planned activity for John Smith.\nWe would like to inform you that Alpha Marine Services will be conducting an equipment inspection on October 10, 2026.",
         },
         {
             "name": "Coordination_Letter_Jane_Smith.docx",
             "candidate_id": "coord-jane",
             "modifiedTime": "2026-09-29",
-            "text": "COORDINATION LETTER\nContact: Jane Smith.\nWe would like to inform you that Beta Engineering will be conducting an equipment inspection on November 12, 2026.",
+            "text": "COORDINATION LETTER\nContact: Jane Smith.\nThis letter coordinates the planned activity for Jane Smith.\nWe would like to inform you that Beta Engineering will be conducting an equipment inspection on November 12, 2026.",
         },
     ]
     from modules.llm import answer_drive_question
@@ -815,6 +1044,7 @@ def test_coordination_letter_paraphrases_keep_schema_and_claim_validation():
         "text": (
             "COORDINATION LETTER\n"
             "Contact: John Smith.\n"
+            "This letter coordinates the planned activity for John Smith.\n"
             "We would like to inform you that Alpha Marine Services will be "
             "conducting an equipment inspection on October 10, 2026."
         ),

@@ -456,7 +456,6 @@ def answer_drive_question(
         )
         if authorization_answer:
             return authorization_answer
-
     handler = evaluate_specialized_handlers(
         question,
         list(evidence.documents),
