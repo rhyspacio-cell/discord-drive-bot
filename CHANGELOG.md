@@ -3,6 +3,24 @@
 All notable changes to this project will be documented in this file.
 ---
 
+## [0.1.3] - 2026-10-02
+
+### Added
+
+#### Evidence Validation and Query Constraints
+
+* Added deterministic constraints for requested subjects, activities, fields, and document types.
+* Added evidence assessment for subject, activity, requested field, document type, and relationship support before evidence is used to answer a question.
+* Added evidence-qualified Coordination Letter aggregation for company and planned activity date records, with references tied to validated source text.
+
+### Improved
+
+* Restricted generated answer context and source references to validated evidence; unsupported, ambiguous, and filename-only matches do not substantiate an answer.
+* Expanded candidate diagnostics with extraction status, evidence eligibility, rejection reasons, and validated reference details.
+* Expanded regression coverage for entity and activity constraints, unsupported role relationships, evidence validation, Coordination Letter aggregation, and Discord answer continuations.
+
+---
+
 ## [0.1.2] - 2026-09-28
 
 ### Fixed
