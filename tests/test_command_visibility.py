@@ -12,6 +12,7 @@ from modules.llm import LocalLLMError
 def make_interaction():
     return SimpleNamespace(
         user=SimpleNamespace(id=123),
+        id=456,
         response=SimpleNamespace(
             send_message=AsyncMock(),
             defer=AsyncMock(),
@@ -97,12 +98,12 @@ def test_ask_drive_posts_question_and_answer_once_publicly(monkeypatch):
     )
     interaction.response.send_message.assert_not_awaited()
     assert interaction.followup.send.await_count == 2
-    assert interaction.followup.send.await_args_list[0].args == (
-        f"**Question:** {question}",
-    )
-    assert interaction.followup.send.await_args_list[1].args == (
-        "Generated answer.",
-    )
+    question_message = interaction.followup.send.await_args_list[0].args[0]
+    answer_message = interaction.followup.send.await_args_list[1].args[0]
+    assert question_message.startswith(f"**Question:** {question}")
+    assert answer_message.startswith("Generated answer.")
+    assert bot_module._decode_qa_marker(question_message) == (456, 123, "question")
+    assert bot_module._decode_qa_marker(answer_message) == (456, 123, "answer")
     assert all(
         call.kwargs["ephemeral"] is False
         for call in interaction.followup.send.await_args_list
@@ -158,5 +159,56 @@ def test_ask_drive_errors_remain_visible(
         ephemeral=False,
         thinking=True,
     )
-    interaction.followup.send.assert_awaited_once()
-    assert interaction.followup.send.await_args.kwargs["ephemeral"] is False
+    assert interaction.followup.send.await_count == 2
+    question_message = interaction.followup.send.await_args_list[0].args[0]
+    failure_message = interaction.followup.send.await_args_list[1].args[0]
+    assert bot_module._decode_qa_marker(question_message) == (456, 123, "question")
+    assert bot_module._decode_qa_marker(failure_message) == (456, 123, "answer")
+    assert all(
+        call.kwargs["ephemeral"] is False
+        for call in interaction.followup.send.await_args_list
+    )
+
+
+@pytest.mark.parametrize(
+    "error_message",
+    [
+        "The local AI model is unavailable or misconfigured.",
+        "The local AI model returned an empty search plan.",
+        "A different local inference failure occurred.",
+    ],
+)
+def test_ask_drive_failure_wording_does_not_change_cleanup_provenance(
+    monkeypatch,
+    error_message,
+):
+    monkeypatch.setattr(
+        bot_module,
+        "interpret_search_request",
+        lambda _question: {"intent": "question"},
+    )
+    monkeypatch.setattr(
+        bot_module,
+        "collect_drive_documents",
+        lambda *_args: ([], None, {"used": []}),
+    )
+    monkeypatch.setattr(
+        bot_module,
+        "answer_drive_question",
+        lambda *_args: (_ for _ in ()).throw(LocalLLMError(error_message)),
+    )
+
+    async def run_in_thread(function, *args):
+        return function(*args)
+
+    monkeypatch.setattr(bot_module.asyncio, "to_thread", run_in_thread)
+    interaction = make_interaction()
+
+    asyncio.run(bot_module.ask_drive.callback(interaction, "Question text"))
+
+    assert interaction.followup.send.await_count == 2
+    question_echo = interaction.followup.send.await_args_list[0].args[0]
+    response = interaction.followup.send.await_args_list[1].args[0]
+    assert bot_module._decode_qa_marker(question_echo) == (456, 123, "question")
+    assert bot_module._decode_qa_marker(response) == (456, 123, "answer")
+    assert "Details:" in response

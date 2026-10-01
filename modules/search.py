@@ -51,6 +51,7 @@ import re
 from datetime import date, datetime, timedelta
 
 from modules.llm import LocalLLMError, generate_local_response
+from modules.query_constraints import extract_query_constraints
 
 
 # ============================================================================
@@ -590,6 +591,61 @@ def _extract_time_range_from_question(question: str):
     return None
 
 
+def _extract_explicit_date_constraints(question: str):
+    """Return explicit document and activity dates mentioned in the question."""
+    if not isinstance(question, str):
+        return {
+            "document_dates": [],
+            "activity_dates": [],
+        }
+
+    text = question.strip()
+    if not text:
+        return {
+            "document_dates": [],
+            "activity_dates": [],
+        }
+
+    months = "(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+    date_text = rf"(?:{months}\s+\d{{1,2}}(?:st|nd|rd|th)?(?:\s*,?\s*\d{{4}})?|\d{{4}}-\d{{1,2}}-\d{{1,2}})"
+
+    document_dates = []
+    activity_dates = []
+
+    for match in re.finditer(date_text, text, flags=re.IGNORECASE):
+        raw_date = match.group(0).strip()
+        try:
+            normalized = _parse_iso_date(raw_date)
+        except ValueError:
+            continue
+
+        if normalized is None:
+            continue
+
+        lower = text.lower()
+        date_context = lower[max(0, match.start() - 30):match.end() + 60]
+        if re.search(r"\b(?:submitted|document|letter|dated|filed)\b", date_context, flags=re.IGNORECASE):
+            document_dates.append(normalized)
+        elif re.search(r"\b(?:planned\s+activity|sampling|scheduled|activity|site\s+visit|conducting)\b", date_context, flags=re.IGNORECASE):
+            activity_dates.append(normalized)
+        elif re.search(r"\b(?:which\s+company|company\s+is\s+associated|for\s+each\s+company|list\s+all\s+applicable|all\s+applicable|what\s+planned\s+activity|what\s+activity)\b", lower, flags=re.IGNORECASE):
+            activity_dates.append(normalized)
+
+    def dedupe(values):
+        seen = set()
+        out = []
+        for value in values:
+            if value not in seen:
+                seen.add(value)
+                out.append(value)
+        return out
+
+    return {
+        "document_dates": dedupe(document_dates),
+        "activity_dates": dedupe(activity_dates),
+    }
+
+
 def _looks_like_date_value(value: str) -> bool:
     """Detect explicit date strings that should not leak into retrieval term lists."""
     if not isinstance(value, str):
@@ -1031,37 +1087,19 @@ The word "documents" is generic and should not be a Drive retrieval term.
 EXAMPLE 5:
 
 Question:
-Give a small paragraph on who Rhys Pacio is and where he is currently working.
+Who is authorized to operate the laboratory vehicle? SEARCH: AUTHORIZATION LETTERS
 
 Good JSON:
 
 {{
-  "intent": "person employment information",
-  "required_terms": [],
-  "phrases": ["rhys pacio"],
-  "optional_terms": [],
-  "context_terms": ["currently", "working"],
-  "exclude_terms": [],
-  "answer_type": "biography",
-  "confidence": 0.95
-}}
-
-EXAMPLE 6:
-
-Question:
-Give a small paragraph on who Rhys Pacio is and where he is currently working now.
-
-Good JSON:
-
-{{
-  "intent": "person employment information",
-  "required_terms": [],
-  "phrases": ["rhys pacio"],
-  "optional_terms": [],
-  "context_terms": ["currently", "working", "working now"],
-  "exclude_terms": [],
-  "answer_type": "biography",
-  "confidence": 0.95
+    "intent": "laboratory vehicle authorization",
+    "required_terms": ["authorization letter"],
+    "phrases": [],
+    "optional_terms": ["laboratory vehicle"],
+    "context_terms": ["authorized", "operate"],
+    "exclude_terms": [],
+    "answer_type": "person",
+    "confidence": 0.95
 }}
 
 Now create the search plan for this question:
@@ -1179,6 +1217,10 @@ def interpret_search_request(question: str):
             raise LocalLLMError(
                 "The local AI model returned an invalid time range."
             )
+
+    explicit_date_constraints = _extract_explicit_date_constraints(question)
+    validated["document_dates"] = explicit_date_constraints["document_dates"]
+    validated["activity_dates"] = explicit_date_constraints["activity_dates"]
 
     for key in SEARCH_PLAN_KEYS:
         validated[key] = [
@@ -1414,6 +1456,7 @@ def interpret_search_request(question: str):
     validated["intent"] = intent.strip()[:300]
     validated["answer_type"] = answer_type.strip()[:100]
     validated["confidence"] = float(confidence)
+    validated["query_constraints"] = extract_query_constraints(question)
 
     # =========================================================================
     # FINAL SAFETY VALIDATION

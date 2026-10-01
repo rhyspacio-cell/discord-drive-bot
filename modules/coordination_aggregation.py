@@ -2,8 +2,11 @@
 
 import re
 from datetime import date
+from dataclasses import dataclass
 
 from modules.drive import is_list_aggregation_query
+from modules.evidence import _coordination_letter_subject_supported
+from modules.query_constraints import extract_query_constraints
 
 
 MONTH_PATTERN = (
@@ -20,17 +23,288 @@ PLANNED_ACTIVITY_PATTERN = re.compile(
     rf"(?P<activity>[^.\n]*?)\bon\s+(?P<date>{DATE_PATTERN})\b",
     re.IGNORECASE,
 )
+ALTERNATE_PLANNED_ACTIVITY_PATTERN = re.compile(
+    rf"\b(?P<company>[A-Z][A-Za-z0-9&.'-]*(?:[ \t]+[A-Z][A-Za-z0-9&.'-]*){{0,5}})[ \t]+"
+    rf"(?i:will\s+be\s+|will\s+|plans?\s+to\s+|is\s+scheduled\s+to\s+)"
+    rf"(?P<activity>[^.\n]*?)\s+(?i:on|for)\s+(?P<date>(?i:{DATE_PATTERN}))\b",
+)
 DATE_VALUE_PATTERN = re.compile(
     rf"(?P<month>{MONTH_PATTERN})\s+"
     r"(?P<day>\d{1,2})(?:st|nd|rd|th)?\s*,?\s+"
     r"(?P<year>\d{4})",
     re.IGNORECASE,
 )
+EXPLICIT_COMPANY_SCOPE_PATTERN = re.compile(
+    r"^\s*for\s+(?P<company>[^,?]+?)\s*,",
+    re.IGNORECASE,
+)
+
+
+def normalize_company_name(value):
+    """Normalize punctuation and spacing for conservative company matching."""
+    return " ".join(
+        re.findall(
+            r"[a-z0-9]+",
+            value.casefold(),
+        )
+    )
+
+
+def _explicit_company_scope(question):
+    match = EXPLICIT_COMPANY_SCOPE_PATTERN.search(str(question))
+    if not match:
+        return None
+    company = re.sub(r"\s+", " ", match.group("company")).strip()
+    normalized = company.casefold()
+    company_markers = (
+        " inc",
+        " corporation",
+        " industries",
+        " engineering",
+        " services",
+        " llc",
+        " limited",
+        " group",
+    )
+    if any(marker in normalized for marker in company_markers):
+        return company
+    is_organization_acronym = (
+        company.isupper()
+        and len(company) > 1
+        and len(company.split()) == 1
+    )
+    is_company_list_scope = bool(
+        re.search(r"\b(?:companies|list\s+all|all\s+planned|dates?)\b", str(question), re.IGNORECASE)
+    )
+    return company if is_organization_acronym and is_company_list_scope else None
+
+
+def _coordination_letter_prefix(text):
+    """Return the leading document window used for coordination-letter schema checks."""
+    if not isinstance(text, str):
+        return ""
+    paragraphs = [
+        paragraph.strip()
+        for paragraph in re.split(r"\n\s*\n", text)
+        if paragraph.strip()
+    ]
+    prefix = "\n".join(paragraphs[:3])
+    return prefix[:2000]
+
+
+def _planned_activity_matches(text):
+    matches = list(PLANNED_ACTIVITY_PATTERN.finditer(text))
+    primary_spans = [(match.start(), match.end()) for match in matches]
+    matches.extend(
+        match
+        for match in ALTERNATE_PLANNED_ACTIVITY_PATTERN.finditer(text)
+        if not any(
+            match.start() < end and start < match.end()
+            for start, end in primary_spans
+        )
+    )
+    unique_matches = {}
+    for match in matches:
+        key = (
+            normalize_company_name(match.group("company")),
+            re.sub(r"\s+", " ", match.group("activity").casefold()).strip(),
+            match.group("date").casefold(),
+        )
+        unique_matches.setdefault(key, match)
+    return sorted(unique_matches.values(), key=lambda match: (match.start(), match.end()))
+
+
+def supporting_document_names(aggregation):
+    """Return unique source names that support the displayed records."""
+    return list(
+        dict.fromkeys(
+            record["source"]
+            for record in aggregation["records"]
+        )
+    )
+
+
+@dataclass(frozen=True)
+class EligibilityResult:
+    """Structured proof that a specialized handler is compatible with current evidence."""
+
+    eligible: bool
+    reason: str = ""
+
+    @property
+    def proven(self):
+        return self.eligible
+
+
+class SpecializedHandler:
+    """Small contract for evidence-qualified specialized document processing."""
+
+    name = "generic"
+    required_schema = {}
+
+    def determine_eligibility(self, question, search_plan, documents):
+        raise NotImplementedError
+
+    def extract_records(self, question, documents, search_plan):
+        raise NotImplementedError
+
+
+def _coordination_letter_query_hint(question, search_plan):
+    """A lightweight candidate-discovery signal only; not proof of eligibility."""
+    if not isinstance(search_plan, dict):
+        return False
+
+    answer_context = " ".join(
+        [
+            str(question),
+            str(search_plan.get("intent", "")),
+            str(search_plan.get("answer_type", "")),
+            *[
+                str(value)
+                for key in (
+                    "required_terms",
+                    "phrases",
+                    "optional_terms",
+                    "context_terms",
+                )
+                for value in (search_plan.get(key, []) or [])
+            ],
+        ]
+    )
+    return re.search(
+        r"\bcoordination\s+letters?\b",
+        answer_context,
+        re.IGNORECASE,
+    ) is not None
+
+
+class CoordinationLetterHandler(SpecializedHandler):
+    """Prove the current evidence actually contains a Coordination Letter schema."""
+
+    name = "coordination_letter"
+    required_schema = {
+        "document_type": "Coordination Letter",
+        "required_fields": [
+            "company",
+            "planned_activity_date",
+            "relationship",
+        ],
+        "semantics": "company is engaged in a planned activity on a specific date",
+    }
+
+    def determine_eligibility(self, question, search_plan, documents):
+        if not isinstance(documents, list) or not documents:
+            return EligibilityResult(False, "no evidence documents supplied")
+
+        if re.search(
+            r"\bactual(?:ly)?\b.*\b(?:entry|enter(?:ed)?)\b",
+            str(question),
+            re.IGNORECASE,
+        ):
+            return EligibilityResult(False, "question asks for actual entry dates, not planned activity dates")
+
+        candidate_hint = _coordination_letter_query_hint(question, search_plan)
+        constraints = (
+            search_plan.get("query_constraints")
+            if isinstance(search_plan, dict)
+            else None
+        ) or extract_query_constraints(question)
+        company_scope = _explicit_company_scope(question)
+        if company_scope:
+            constraints = dict(constraints)
+            constraints["subject_entity"] = company_scope
+            constraints["subject_type"] = "company"
+
+        proven_document = False
+        for document in documents:
+            text = document.get("text", "")
+            if not isinstance(text, str):
+                text = ""
+
+            if not re.search(
+                r"\bcoordination\s+letters?\b",
+                _coordination_letter_prefix(text),
+                re.IGNORECASE,
+            ):
+                continue
+
+            matches = _planned_activity_matches(text)
+            if not matches:
+                continue
+
+            for match in matches:
+                company = re.sub(r"\s+", " ", match.group("company")).strip().rstrip(".").strip()
+                planned_date = parse_planned_date(match.group("date"))
+                if company and planned_date and _coordination_event_matches_constraints(
+                    match,
+                    text,
+                    constraints,
+                ):
+                    proven_document = True
+                    break
+
+            if proven_document:
+                break
+
+        if not proven_document and not candidate_hint:
+            return EligibilityResult(False, "query and current evidence do not prove Coordination Letter schema")
+
+        if not proven_document:
+            return EligibilityResult(False, "current evidence does not prove Coordination Letter company/date schema")
+
+        return EligibilityResult(True, "current evidence proves the Coordination Letter schema")
+
+    def extract_records(self, question, documents, search_plan):
+        return extract_coordination_letter_records(question, documents, search_plan)
+
+
+def get_specialized_handlers():
+    """Return the currently registered specialized handlers."""
+    return [CoordinationLetterHandler()]
+
+
+def evaluate_specialized_handlers(question, documents, search_plan):
+    """Select a specialized handler only when current evidence proves its schema."""
+    for handler in get_specialized_handlers():
+        eligibility = handler.determine_eligibility(question, search_plan, documents)
+        if eligibility.proven:
+            return handler
+    return None
+
+
+def _coordination_event_matches_constraints(match, text, constraints):
+    """Verify requested entity/activity against the same current record evidence."""
+    subject = constraints.get("subject_entity")
+    subject_type = constraints.get("subject_type")
+    if subject and subject_type == "company":
+        company = re.sub(r"\s+", " ", match.group("company")).strip().rstrip(".").strip()
+        subject_key = normalize_company_name(subject)
+        company_key = normalize_company_name(company)
+        if company_key != subject_key and not company_key.startswith(f"{subject_key} "):
+            return False
+    elif subject:
+        start = max(0, match.start() - 300)
+        end = min(len(text), match.end() + 300)
+        if not _coordination_letter_subject_supported(
+            text[start:end],
+            subject,
+            subject_type,
+        ):
+            return False
+
+    activity = constraints.get("activity")
+    if activity:
+        expected = re.findall(r"[a-z0-9]+", activity.casefold())
+        actual = re.findall(r"[a-z0-9]+", match.group("activity").casefold())
+        if not expected or any(term not in actual for term in expected):
+            return False
+
+    return True
 
 
 def is_coordination_letter_aggregation(question, search_plan):
-    """Return whether an explicit-range aggregation targets Coordination Letters."""
-    if not is_list_aggregation_query(search_plan):
+    """Return whether the question targets Coordination Letter evidence or aggregation."""
+    if not isinstance(search_plan, dict):
         return False
     if re.search(
         r"\bactual(?:ly)?\b.*\b(?:entry|enter(?:ed)?)\b",
@@ -58,11 +332,25 @@ def is_coordination_letter_aggregation(question, search_plan):
             *plan_terms,
         ]
     )
-    return re.search(
+
+    coordination_hit = re.search(
         r"\bcoordination\s+letters?\b",
         answer_context,
         re.IGNORECASE,
     ) is not None
+
+    if not coordination_hit:
+        return False
+
+    if is_list_aggregation_query(search_plan):
+        return True
+
+    explicit_date_context = re.search(
+        r"\b(?:submitted\s+on|planned\s+activity|sampling|scheduled|activity\s+date|company\s+associated|list\s+all|for\s+each\s+company|all\s+applicable)\b",
+        answer_context,
+        re.IGNORECASE,
+    )
+    return explicit_date_context is not None
 
 
 def parse_planned_date(value):
@@ -127,13 +415,97 @@ def _date_bound(search_plan, key, question):
         return None
 
 
+def _extract_document_dates(question):
+    """Extract exact document/submission dates from the question."""
+    if not isinstance(question, str):
+        return []
+
+    dates = []
+    for match in re.finditer(
+        rf"(?:{MONTH_PATTERN})\s+\d{{1,2}}(?:st|nd|rd|th)?(?:\s*,?\s*\d{{4}})?|\d{{4}}-\d{{1,2}}-\d{{1,2}}",
+        question,
+        re.IGNORECASE,
+    ):
+        date_value = parse_planned_date(match.group(0))
+        if date_value is None:
+            continue
+        context = question[max(0, match.start() - 25):match.end() + 40].lower()
+        if re.search(r"\b(?:submitted|document|letter|dated|filed)\b", context, re.IGNORECASE):
+            dates.append(date_value)
+
+    return list(dict.fromkeys(dates))
+
+
+def _extract_question_date(question):
+    """Return a single explicit planned/sampling date from the question when present."""
+    if not isinstance(question, str):
+        return None
+
+    text = question.strip()
+    if not text:
+        return None
+
+    if re.search(r"\b(?:submitted|document|letter|dated|filed)\b", text, re.IGNORECASE):
+        return None
+
+    matches = []
+    for match in re.finditer(
+        rf"(?:{MONTH_PATTERN})\s+\d{{1,2}}(?:st|nd|rd|th)?(?:\s*,?\s*\d{{4}})?|\d{{4}}-\d{{1,2}}-\d{{1,2}}",
+        text,
+        re.IGNORECASE,
+    ):
+        value = parse_planned_date(match.group(0))
+        if value is not None:
+            matches.append(value)
+
+    if not matches:
+        return None
+
+    return matches[0]
+
+
+def _extract_submission_dates(text):
+    """Parse submission/document dates in a Coordination Letter document."""
+    if not isinstance(text, str):
+        return []
+
+    dates = []
+    for match in re.finditer(
+        rf"(?:DATE\s+SUBMITTED|DATE\s+FILED|DATE\s+ISSUED|DATED|SUBMITTED\s+ON)\s*[:\-]?\s*(?:{MONTH_PATTERN})\s+\d{{1,2}}(?:st|nd|rd|th)?(?:\s*,?\s*\d{{4}})?|\d{{4}}-\d{{1,2}}-\d{{1,2}}",
+        text,
+        re.IGNORECASE,
+    ):
+        parsed = parse_planned_date(match.group(0).split(":")[-1].strip() if ":" in match.group(0) else match.group(0))
+        if parsed is not None:
+            dates.append(parsed)
+
+    return list(dict.fromkeys(dates))
+
+
 def extract_coordination_letter_records(question, documents, search_plan):
     """Extract evidence-backed company/planned-date records for this query type."""
-    if not is_coordination_letter_aggregation(question, search_plan):
+    is_aggregation = is_coordination_letter_aggregation(question, search_plan)
+    requested_date = _extract_question_date(question)
+    document_dates = _extract_document_dates(question)
+
+    if not is_aggregation and requested_date is None and not document_dates:
         return None
 
     lower_bound = _date_bound(search_plan, "from", question)
     upper_bound = _date_bound(search_plan, "to", question)
+    requested_company = _explicit_company_scope(question)
+    constraints = (
+        search_plan.get("query_constraints")
+        if isinstance(search_plan, dict)
+        else None
+    ) or extract_query_constraints(question)
+    if not requested_company and constraints.get("subject_type") == "company":
+        requested_company = constraints.get("subject_entity")
+    event_constraints = constraints
+    if requested_company:
+        event_constraints = dict(constraints)
+        event_constraints["subject_entity"] = requested_company
+        event_constraints["subject_type"] = "company"
     records = []
     unresolved = []
 
@@ -145,12 +517,17 @@ def extract_coordination_letter_records(question, documents, search_plan):
 
         if not re.search(
             r"\bcoordination\s+letters?\b",
-            f"{name}\n{text[:500]}",
+            _coordination_letter_prefix(text),
             re.IGNORECASE,
         ):
             continue
 
-        matches = list(PLANNED_ACTIVITY_PATTERN.finditer(text))
+        if document_dates:
+            submission_dates = _extract_submission_dates(text)
+            if not any(doc_date in submission_dates for doc_date in document_dates):
+                continue
+
+        matches = _planned_activity_matches(text)
         if not matches:
             unresolved.append(name)
             continue
@@ -168,19 +545,25 @@ def extract_coordination_letter_records(question, documents, search_plan):
                 continue
 
             found_supported_event = True
+            if not _coordination_event_matches_constraints(match, text, event_constraints):
+                continue
+            if requested_date is not None and planned_date != requested_date:
+                continue
             if lower_bound and planned_date < lower_bound:
                 continue
             if upper_bound and planned_date > upper_bound:
                 continue
 
-            records.append(
-                {
-                    "company": company,
-                    "date": planned_date,
-                    "source": name,
-                    "evidence": match.group(0),
-                }
-            )
+            record = {
+                "company": company,
+                "date": planned_date,
+                "source": name,
+                "evidence": match.group(0),
+            }
+            source_id = document.get("file_id") or document.get("candidate_id")
+            if source_id:
+                record["source_id"] = source_id
+            records.append(record)
 
         if not found_supported_event and not any(
             unresolved_name == name
@@ -188,10 +571,38 @@ def extract_coordination_letter_records(question, documents, search_plan):
         ):
             unresolved.append(name)
 
-    return {
+    scope_unresolved = None
+    if requested_company:
+        requested_key = normalize_company_name(requested_company)
+        matching_records = [
+            record
+            for record in records
+            if normalize_company_name(record["company"]) == requested_key
+            or normalize_company_name(record["company"]).startswith(
+                f"{requested_key} "
+            )
+        ]
+        matched_company_names = {
+            normalize_company_name(record["company"])
+            for record in matching_records
+        }
+        if len(matched_company_names) > 1:
+            records = []
+            scope_unresolved = requested_company
+        else:
+            records = matching_records
+            if not records:
+                scope_unresolved = requested_company
+
+    aggregation = {
         "records": records,
         "unresolved": unresolved,
     }
+    if requested_company:
+        aggregation["requested_company"] = requested_company
+        aggregation["scope_unresolved"] = scope_unresolved
+
+    return aggregation
 
 
 def format_coordination_letter_records(aggregation):
@@ -219,7 +630,13 @@ def format_coordination_letter_records(aggregation):
                 + "; ".join(date_values)
             )
     else:
-        lines.append("- No company/planned activity date could be established from the supplied letters.")
+        if aggregation.get("scope_unresolved"):
+            lines.append(
+                f"- No qualifying planned activity date could be uniquely "
+                f"matched to {aggregation['scope_unresolved']} in the supplied letters."
+            )
+        else:
+            lines.append("- No company/planned activity date could be established from the supplied letters.")
 
     if aggregation["unresolved"]:
         lines.append("")

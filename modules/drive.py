@@ -1,4 +1,5 @@
 import io
+import logging
 import random
 import re
 import time
@@ -17,6 +18,15 @@ from modules.config import (
     MAX_TOTAL_CHARS,
 )
 from modules.storage import load_credentials, save_credentials
+from modules.query_constraints import extract_query_constraints
+from modules.evidence import (
+    EvidenceState,
+    ExtractionStatus,
+    validate_candidates,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 class DriveError(RuntimeError):
@@ -447,7 +457,18 @@ def extract_file_text(service, file_info):
         paragraphs = [
             paragraph.text
             for paragraph in document.paragraphs
+            if paragraph.text.strip()
         ]
+        paragraphs.extend(_extract_docx_table_text(table) for table in document.tables)
+        paragraphs.extend(
+            paragraph.text
+            for section in document.sections
+            for paragraph in (
+                list(section.header.paragraphs)
+                + list(section.footer.paragraphs)
+            )
+            if paragraph.text.strip()
+        )
 
         return filename, "\n".join(
             paragraphs
@@ -461,6 +482,50 @@ def extract_file_text(service, file_info):
         )
 
     return filename, ""
+
+
+def _extract_docx_table_text(table):
+    """Extract table rows, including nested tables, without dropping form fields."""
+    rows = []
+    for row in table.rows:
+        cells = []
+        for cell in row.cells:
+            parts = [
+                paragraph.text.strip()
+                for paragraph in cell.paragraphs
+                if paragraph.text.strip()
+            ]
+            parts.extend(
+                _extract_docx_table_text(nested_table)
+                for nested_table in cell.tables
+            )
+            cells.append(" ".join(parts))
+        if any(cells):
+            rows.append(" | ".join(cells))
+    return "\n".join(rows)
+
+
+def _extraction_method(file_info):
+    mime_type = file_info.get("mimeType", "")
+    filename = str(file_info.get("name", "")).lower()
+    if mime_type in {
+        "application/vnd.google-apps.document",
+        "application/vnd.google-apps.presentation",
+        "application/vnd.google-apps.spreadsheet",
+    }:
+        return "google_drive_export"
+    if mime_type == "application/pdf" or filename.endswith(".pdf"):
+        return "pdf_text"
+    if (
+        mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        or filename.endswith(".docx")
+    ):
+        return "docx_paragraphs_tables_headers_footers"
+    if mime_type.startswith("text/") or filename.endswith(
+        (".txt", ".md", ".csv", ".json", ".xml", ".html", ".py", ".js", ".ts", ".css", ".sql")
+    ):
+        return "text_decode"
+    return None
 
 
 def is_google_export(file_info):
@@ -689,10 +754,21 @@ def select_extraction_candidates(metadata_ranked, search_plan=None):
     if not metadata_ranked:
         return []
 
-    candidate_limit = min(
-        len(metadata_ranked),
-        get_document_limit_for_query(search_plan),
+    query_constraints = (
+        search_plan.get("query_constraints", {})
+        if isinstance(search_plan, dict)
+        else {}
     )
+    has_semantic_constraints = bool(
+        query_constraints.get("subject_entity")
+        or query_constraints.get("activity")
+    )
+    limit = (
+        get_drive_candidate_limit()
+        if has_semantic_constraints and not is_list_aggregation_query(search_plan)
+        else get_document_limit_for_query(search_plan)
+    )
+    candidate_limit = min(len(metadata_ranked), limit)
 
     return [
         file_info
@@ -794,11 +870,30 @@ def build_drive_search_query(
             search_plan.get("time_range")
         )
 
+        document_dates = [
+            str(value).strip()
+            for value in search_plan.get("document_dates", [])
+            if isinstance(value, str) and value.strip()
+        ]
+        activity_dates = [
+            str(value).strip()
+            for value in search_plan.get("activity_dates", [])
+            if isinstance(value, str) and value.strip()
+        ]
+
         all_positive_values = (
             required_terms
             + phrases
             + optional_terms
         )
+
+        query_constraints = search_plan.get("query_constraints") or {}
+        subject_entity = query_constraints.get("subject_entity")
+        activity = query_constraints.get("activity")
+        if isinstance(subject_entity, str) and subject_entity.strip():
+            all_positive_values.append(subject_entity.strip())
+        if isinstance(activity, str) and activity.strip():
+            all_positive_values.append(activity.strip())
 
         if not all(
             isinstance(term, str)
@@ -842,6 +937,13 @@ def build_drive_search_query(
             required_terms
         )
 
+        if isinstance(subject_entity, str) and subject_entity.strip():
+            terms.append(subject_entity.strip().lower())
+        if isinstance(activity, str) and activity.strip():
+            terms.extend(
+                re.findall(r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)*", activity.lower())
+            )
+
         # Break phrases into searchable words.
         for phrase in phrases:
             phrase_terms = [
@@ -862,6 +964,17 @@ def build_drive_search_query(
         )
 
         # Remove duplicates while preserving order.
+        for date_value in document_dates + activity_dates:
+            date_terms = [
+                term
+                for term in re.findall(
+                    r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)*",
+                    date_value,
+                )
+                if term
+            ]
+            terms.extend(date_terms)
+
         terms = list(
             dict.fromkeys(
                 term
@@ -1048,13 +1161,74 @@ def score_file_relevance(
 
         required_terms = search_terms
 
+    constraints = (
+        search_plan.get("query_constraints")
+        if isinstance(search_plan, dict)
+        else None
+    ) or extract_query_constraints(question)
+
+    subject_entity = constraints.get("subject_entity")
+    activity = constraints.get("activity")
+
+    if content and (subject_entity or activity):
+        evidence_sentences = re.split(r"(?<=[.!?])\s+|\n\s*\n", content)
+        matched_relationship = False
+
+        for sentence in evidence_sentences:
+            sentence_words = re.findall(r"[a-z0-9]+", sentence)
+            if subject_entity:
+                subject_words = re.findall(r"[a-z0-9]+", subject_entity.lower())
+                subject_present = bool(subject_words) and any(
+                    sentence_words[index:index + len(subject_words)] == subject_words
+                    for index in range(
+                        max(0, len(sentence_words) - len(subject_words) + 1)
+                    )
+                )
+            else:
+                subject_present = True
+
+            if activity:
+                activity_words = re.findall(r"[a-z0-9]+", activity.lower())
+                activity_positions = [
+                    index
+                    for index, word in enumerate(sentence_words)
+                    if word in activity_words
+                ]
+                activity_present = (
+                    len(set(activity_words)) == len(set(
+                        sentence_words[index]
+                        for index in activity_positions
+                    ))
+                    and bool(activity_positions)
+                    and max(activity_positions) - min(activity_positions) <= 6
+                )
+            else:
+                activity_present = True
+
+            if subject_present and activity_present:
+                matched_relationship = True
+                break
+
+        if not matched_relationship:
+            return 0
+
     score = 0
     reasons = []
+
+    if content and subject_entity:
+        score += 120
+        reasons.append("subject entity and activity relationship in evidence")
+    if content and activity:
+        score += 80
+        reasons.append("activity terms in coherent evidence")
 
     # Score individual search terms.
     for term in search_terms:
 
         if not term:
+            continue
+
+        if term in {"2026", "2025", "2024", "2023"}:
             continue
 
         # Filename substring match.
@@ -1194,10 +1368,15 @@ def _collect_documents_for_query(
             "candidates": [],
             "analyzed": [],
             "used": [],
+            "assessments": {},
+            "state": EvidenceState.NO_CANDIDATES.value,
             "skipped": [],
             "failed": [],
             "empty": [],
         }
+    search_audit.setdefault("assessments", {})
+    search_audit.setdefault("assessment_records", [])
+    search_audit.setdefault("candidate_diagnostics", [])
 
     candidates = []
     skipped_files = []
@@ -1266,6 +1445,32 @@ def _collect_documents_for_query(
         len(candidates),
     )
 
+    candidate_diagnostics = []
+    diagnostics_by_id = {}
+    for index, file_info in enumerate(candidates):
+        filename = file_info.get("name", "Unnamed file")
+        file_id = file_info.get("id")
+        candidate_id = str(file_id or f"{filename}::{index}")
+        diagnostic = {
+            "candidate_id": candidate_id,
+            "file_id": file_id,
+            "file_name": filename,
+            "mime_type": file_info.get("mimeType"),
+            "extraction_method": _extraction_method(file_info),
+            "retrieved": True,
+            "extraction_status": ExtractionStatus.NOT_ATTEMPTED.value,
+            "extraction_error": None,
+            "extracted_char_count": 0,
+            "extracted_text_available": False,
+        }
+        candidate_diagnostics.append(diagnostic)
+        diagnostics_by_id[candidate_id] = diagnostic
+    search_audit["candidate_diagnostics"] = candidate_diagnostics
+    logger.debug(
+        "Drive query constraints: %s",
+        (search_plan or {}).get("query_constraints", {}),
+    )
+
     metadata_ranked = [
         (
             score_file_relevance(
@@ -1280,8 +1485,11 @@ def _collect_documents_for_query(
     ]
 
     metadata_ranked.sort(
-        key=lambda item: item[0],
-        reverse=True,
+        key=lambda item: (
+            -item[0],
+            str(item[1].get("name", "")).casefold(),
+            str(item[1].get("id", "")),
+        ),
     )
 
     extraction_candidates = select_extraction_candidates(
@@ -1302,12 +1510,28 @@ def _collect_documents_for_query(
 
     extracted_documents = []
 
+    candidate_indexes = {id(info): index for index, info in enumerate(candidates)}
     for file_info in extraction_candidates:
 
         filename = file_info.get(
             "name",
             "Unnamed file",
         )
+        candidate_index = candidate_indexes.get(id(file_info), 0)
+        file_id = file_info.get("id")
+        candidate_id = str(file_id or f"{filename}::{candidate_index}")
+        candidate_diagnostic = diagnostics_by_id[candidate_id]
+
+        def mark_extraction(status, error=None, text=None, resolved_info=None):
+            candidate_diagnostic["extraction_status"] = status.value
+            candidate_diagnostic["extraction_error"] = error
+            if text is not None:
+                candidate_diagnostic["extracted_char_count"] = len(text)
+                candidate_diagnostic["extracted_text_available"] = bool(text.strip())
+            if resolved_info is not None:
+                candidate_diagnostic["mime_type"] = resolved_info.get("mimeType")
+                candidate_diagnostic["extraction_method"] = _extraction_method(resolved_info)
+            logger.debug("Drive extraction lifecycle: %s", candidate_diagnostic)
 
         # ---------------------------------------------------------
         # Resolve Drive shortcuts BEFORE checking extractability.
@@ -1328,6 +1552,7 @@ def _collect_documents_for_query(
         except DriveFileUnavailableError as exc:
 
             reason = str(exc)
+            mark_extraction(ExtractionStatus.FAILURE, reason)
 
             skipped_files.append(
                 filename
@@ -1386,6 +1611,8 @@ def _collect_documents_for_query(
                     f"HTTP {status_code}."
                 )
 
+            mark_extraction(ExtractionStatus.FAILURE, reason)
+
             skipped_files.append(
                 filename
             )
@@ -1414,6 +1641,11 @@ def _collect_documents_for_query(
         ):
             reason = (
                 "File type is not supported by the text extractor."
+            )
+            mark_extraction(
+                ExtractionStatus.UNSUPPORTED,
+                reason,
+                resolved_info=resolved_file_info,
             )
 
             skipped_files.append(
@@ -1463,6 +1695,11 @@ def _collect_documents_for_query(
                         f"{MAX_DOWNLOAD_BYTES} byte "
                         f"download limit."
                     )
+                    mark_extraction(
+                        ExtractionStatus.FAILURE,
+                        reason,
+                        resolved_info=resolved_file_info,
+                    )
 
                     skipped_files.append(
                         filename
@@ -1507,6 +1744,7 @@ def _collect_documents_for_query(
         except DriveFileTooLargeError as exc:
 
             reason = str(exc)
+            mark_extraction(ExtractionStatus.FAILURE, reason, resolved_info=resolved_file_info)
 
             skipped_files.append(
                 filename
@@ -1530,6 +1768,7 @@ def _collect_documents_for_query(
         except DriveFileUnavailableError as exc:
 
             reason = str(exc)
+            mark_extraction(ExtractionStatus.FAILURE, reason, resolved_info=resolved_file_info)
 
             skipped_files.append(
                 filename
@@ -1588,6 +1827,8 @@ def _collect_documents_for_query(
                     f"HTTP {status_code}."
                 )
 
+            mark_extraction(ExtractionStatus.FAILURE, reason, resolved_info=resolved_file_info)
+
             skipped_files.append(
                 filename
             )
@@ -1616,6 +1857,7 @@ def _collect_documents_for_query(
                 "File operation timed out "
                 "or could not be completed."
             )
+            mark_extraction(ExtractionStatus.FAILURE, reason, resolved_info=resolved_file_info)
 
             skipped_files.append(
                 filename
@@ -1641,6 +1883,7 @@ def _collect_documents_for_query(
             reason = (
                 f"{type(exc).__name__}: {exc}"
             )
+            mark_extraction(ExtractionStatus.FAILURE, reason, resolved_info=resolved_file_info)
 
             search_audit[
                 "failed"
@@ -1661,8 +1904,16 @@ def _collect_documents_for_query(
         # The extracted content came from the resolved target.
         extracted_filename = filename
 
+        if not isinstance(text, str):
+            text = "" if text is None else str(text)
+
         # Successfully extracted but no usable text.
         if not text.strip():
+            mark_extraction(
+                ExtractionStatus.EMPTY,
+                text=text,
+                resolved_info=resolved_file_info,
+            )
 
             search_audit[
                 "empty"
@@ -1680,6 +1931,17 @@ def _collect_documents_for_query(
         text = text[
             :MAX_CHARS_PER_FILE
         ]
+        mark_extraction(
+            ExtractionStatus.SUCCESS,
+            text=text,
+            resolved_info=resolved_file_info,
+        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Extracted text prefix for %s: %r",
+                candidate_diagnostic["candidate_id"],
+                text[:200],
+            )
 
         score = score_file_relevance(
             file_info,
@@ -1700,14 +1962,38 @@ def _collect_documents_for_query(
                 ),
                 "text": text,
                 "score": score,
+                "candidate_id": candidate_id,
+                "file_id": file_id,
+                "mime_type": resolved_file_info.get("mimeType"),
+                "extraction_method": candidate_diagnostic["extraction_method"],
+                "extraction_status": candidate_diagnostic["extraction_status"],
+                "extraction_error": None,
             }
         )
 
+    assessment_result = validate_candidates(
+        question,
+        extracted_documents,
+        search_plan,
+        search_audit,
+    )
+    for document in extracted_documents:
+        document["_evidence_assessment"] = assessment_result.assessments[
+            document.get("file_id") or document["candidate_id"]
+        ]
+
+    if not extracted_documents and (
+        search_audit.get("failed")
+        or search_audit.get("skipped")
+        or search_audit.get("empty")
+    ):
+        search_audit["state"] = EvidenceState.EXTRACTION_FAILURE.value
+
     # Highest relevance first.
     extracted_documents.sort(
-        key=lambda document: document.get(
-            "score",
-            0,
+        key=lambda document: (
+            bool(document["_evidence_assessment"].eligible),
+            document.get("score", 0),
         ),
         reverse=True,
     )
@@ -1721,12 +2007,7 @@ def _collect_documents_for_query(
     # for the complete set across the requested range.
     if extracted_documents:
 
-        highest_score = (
-            extracted_documents[0].get(
-                "score",
-                0,
-            )
-        )
+        highest_score = max(document.get("score", 0) for document in extracted_documents)
 
         if is_list_aggregation_query(search_plan):
             minimum_score = 1
@@ -1739,10 +2020,8 @@ def _collect_documents_for_query(
         extracted_documents = [
             document
             for document in extracted_documents
-            if document.get(
-                "score",
-                0,
-            ) >= minimum_score
+            if document["_evidence_assessment"].eligible
+            or document.get("score", 0) >= minimum_score
         ]
 
         print(
@@ -1793,11 +2072,8 @@ def _collect_documents_for_query(
             document
         )
 
-    # These are the files actually sent to the LLM.
-    search_audit["used"] = [
-        document["name"]
-        for document in documents
-    ]
+    # Candidate extraction is not evidence use; the answer boundary records used files.
+    search_audit["used"] = []
 
     print(
         "[SEARCH RESULTS]",

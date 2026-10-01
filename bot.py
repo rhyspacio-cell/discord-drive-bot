@@ -43,6 +43,7 @@ All user-facing command responses are visible in the channel.
 
 import asyncio
 import threading
+from datetime import timedelta, timezone
 
 import discord
 from discord import app_commands
@@ -91,6 +92,226 @@ class DriveBot(commands.Bot):
 
 
 bot = DriveBot()
+
+_QA_MARKER_START = "\u2063"
+_QA_MARKER_END = "\u2064"
+_QA_MARKER_ZERO = "\u200b"
+_QA_MARKER_ONE = "\u200c"
+_QA_MARKER_BITS = 17 * 8
+
+
+def _encode_qa_marker(interaction_id, user_id, role):
+    role_value = {"question": 0, "answer": 1}.get(role)
+    if role_value is None:
+        raise ValueError("Unknown Q&A marker role.")
+    payload = (
+        int(interaction_id).to_bytes(8, "big")
+        + int(user_id).to_bytes(8, "big")
+        + bytes((role_value,))
+    )
+    bits = "".join(f"{value:08b}" for value in payload)
+    hidden_bits = bits.translate(str.maketrans({
+        "0": _QA_MARKER_ZERO,
+        "1": _QA_MARKER_ONE,
+    }))
+    return f"{_QA_MARKER_START}{hidden_bits}{_QA_MARKER_END}"
+
+
+def _qa_interaction_markers(interaction):
+    return (
+        _encode_qa_marker(interaction.id, interaction.user.id, "question"),
+        _encode_qa_marker(interaction.id, interaction.user.id, "answer"),
+    )
+
+
+async def _send_marked_qa_message(interaction, text, marker):
+    for chunk in split_discord_message(text, limit=1800):
+        await interaction.followup.send(
+            chunk + marker,
+            ephemeral=False,
+        )
+
+
+def _decode_qa_marker(content):
+    if not isinstance(content, str):
+        return None
+    start = content.rfind(_QA_MARKER_START)
+    end = content.find(_QA_MARKER_END, start + 1)
+    if start < 0 or end < 0:
+        return None
+    hidden_bits = content[start + 1:end]
+    if len(hidden_bits) != _QA_MARKER_BITS:
+        return None
+    bit_values = {
+        _QA_MARKER_ZERO: "0",
+        _QA_MARKER_ONE: "1",
+    }
+    try:
+        bits = "".join(bit_values[character] for character in hidden_bits)
+    except KeyError:
+        return None
+    payload = int(bits, 2).to_bytes(17, "big")
+    role = {0: "question", 1: "answer"}.get(payload[-1])
+    if role is None:
+        return None
+    return (
+        int.from_bytes(payload[:8], "big"),
+        int.from_bytes(payload[8:16], "big"),
+        role,
+    )
+
+
+def _is_in_time_window(message, cutoff, now):
+    created_at = getattr(message, "created_at", None)
+    if created_at is None:
+        return False
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    return cutoff <= created_at <= now
+
+
+def _legacy_ask_drive_marker(message):
+    metadata = (
+        getattr(message, "interaction_metadata", None)
+        or getattr(message, "interaction", None)
+    )
+    if getattr(metadata, "name", None) not in {"ask-drive", "/ask-drive"}:
+        return None
+    interaction_id = getattr(metadata, "id", None)
+    metadata_user = getattr(metadata, "user", None)
+    user_id = getattr(metadata, "user_id", None) or getattr(metadata_user, "id", None)
+    if interaction_id is None or user_id is None:
+        return None
+    role = (
+        "question"
+        if getattr(message, "content", "").startswith("**Question:**")
+        else "answer"
+    )
+    return int(interaction_id), int(user_id), role
+
+
+def _find_qna_cleanup_groups(messages, bot_user_id, cutoff, now):
+    recent_messages = [
+        message
+        for message in messages
+        if _is_in_time_window(message, cutoff, now)
+    ]
+    groups = {}
+
+    for message in recent_messages:
+        author = getattr(message, "author", None)
+        if getattr(author, "id", None) != bot_user_id:
+            continue
+        marker = _decode_qa_marker(getattr(message, "content", ""))
+        if marker is None:
+            marker = _legacy_ask_drive_marker(message)
+            if marker is None:
+                continue
+        interaction_id, user_id, role = marker
+        group = groups.setdefault(
+            (interaction_id, user_id),
+            {"questions": [], "answers": []},
+        )
+        group["questions" if role == "question" else "answers"].append(message)
+
+    paired_groups = []
+    skipped = 0
+    for (interaction_id, user_id), group in groups.items():
+        if not group["answers"]:
+            skipped += len(group["answers"]) + len(group["questions"])
+            continue
+
+        question_messages = list(group["questions"])
+        for message in recent_messages:
+            author = getattr(message, "author", None)
+            if getattr(author, "id", None) != user_id or getattr(author, "bot", False):
+                continue
+            metadata = (
+                getattr(message, "interaction_metadata", None)
+                or getattr(message, "interaction", None)
+            )
+            if getattr(metadata, "id", None) == interaction_id:
+                question_messages.append(message)
+
+        question_messages = list({
+            message.id: message for message in question_messages
+        }.values())
+        if not question_messages:
+            skipped += len(group["answers"])
+            continue
+
+        paired_groups.append({
+            "answers": group["answers"],
+            "questions": question_messages,
+        })
+
+    return paired_groups, skipped
+
+
+async def _cleanup_channel_history(channel, bot_user_id, now=None):
+    """Delete recent marked pairs one-by-one for precise age and failure handling."""
+    now = now or discord.utils.utcnow()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    cutoff = now - timedelta(hours=24)
+
+    try:
+        messages = [
+            message
+            async for message in channel.history(
+                limit=None,
+                after=cutoff,
+                oldest_first=True,
+            )
+        ]
+    except Exception:
+        return {
+            "responses_deleted": 0,
+            "questions_deleted": 0,
+            "skipped": 0,
+            "failures": 1,
+            "history_failed": True,
+        }
+
+    groups, skipped = _find_qna_cleanup_groups(
+        messages,
+        bot_user_id,
+        cutoff,
+        now,
+    )
+    responses_deleted = 0
+    questions_deleted = 0
+    failures = 0
+
+    for group in groups:
+        response_group_failed = False
+        for index, message in enumerate(group["answers"]):
+            try:
+                await message.delete()
+                responses_deleted += 1
+            except Exception:
+                failures += 1
+                skipped += len(group["answers"]) - index - 1
+                skipped += len(group["questions"])
+                response_group_failed = True
+                break
+        if response_group_failed:
+            continue
+
+        for message in group["questions"]:
+            try:
+                await message.delete()
+                questions_deleted += 1
+            except Exception:
+                failures += 1
+
+    return {
+        "responses_deleted": responses_deleted,
+        "questions_deleted": questions_deleted,
+        "skipped": skipped,
+        "failures": failures,
+        "history_failed": False,
+    }
 
 
 def split_discord_message(
@@ -255,10 +476,38 @@ def format_drive_answer(
     if answer:
         lines.append(answer)
 
-    used = search_audit.get(
-        "used",
-        [],
+    candidate_diagnostics = search_audit.get("candidate_diagnostics", [])
+    validated_evidence_ids = set(
+        search_audit.get("validated_evidence_document_ids", [])
     )
+    validated_spans_by_id = {}
+    for record in search_audit.get("validated_evidence_spans", []):
+        if record.get("document_id") and record.get("evidence_span"):
+            validated_spans_by_id.setdefault(record["document_id"], []).append(
+                record["evidence_span"]
+            )
+    reference_evidence = []
+    orphan_reference_count = 0
+    for record in search_audit.get("reference_evidence", []):
+        document_id = record.get("document_id")
+        if (
+            document_id not in validated_evidence_ids
+            or not record.get("evidence_span")
+            or not any(
+                record["evidence_span"] in span
+                for span in validated_spans_by_id.get(document_id, [])
+            )
+            or record.get("supports_final_claim") is not True
+            or not record.get("file_name")
+        ):
+            orphan_reference_count += 1
+            continue
+        reference_evidence.append(record)
+    if orphan_reference_count:
+        search_audit["reference_firewall_rejected"] = orphan_reference_count
+    used = list(dict.fromkeys(
+        record["file_name"] for record in reference_evidence
+    ))
 
     analyzed = search_audit.get(
         "analyzed",
@@ -302,6 +551,9 @@ def format_drive_answer(
     # report the same file under multiple headings.
 
     used_set = set(used)
+    used_candidate_ids = {
+        record["document_id"] for record in reference_evidence
+    }
 
     skipped_names = {
         item["name"]
@@ -315,14 +567,24 @@ def format_drive_answer(
 
     empty_names = set(empty)
 
-    analyzed_not_used = [
-        name
-        for name in analyzed
-        if name not in used_set
-        and name not in skipped_names
-        and name not in failed_names
-        and name not in empty_names
-    ]
+    if candidate_diagnostics and used_candidate_ids:
+        analyzed_not_used = [
+            item
+            for item in candidate_diagnostics
+            if item.get("extraction_status") == "SUCCESS"
+            and item.get("candidate_id") not in used_candidate_ids
+            and item.get("file_id") not in used_candidate_ids
+            and item.get("file_name") not in used_set
+        ]
+    else:
+        analyzed_not_used = [
+            {"file_name": name}
+            for name in analyzed
+            if name not in used_set
+            and name not in skipped_names
+            and name not in failed_names
+            and name not in empty_names
+        ]
 
     if analyzed_not_used:
         lines.append("")
@@ -330,10 +592,25 @@ def format_drive_answer(
             "**Files analyzed but not used**"
         )
 
-        for name in analyzed_not_used:
+        for item in analyzed_not_used:
+            name = item.get("file_name", item.get("name", "Unnamed file"))
             lines.append(
                 f"- `{name}`"
             )
+            if search_audit.get("debug"):
+                assessment = next(
+                    (
+                        assessment
+                        for assessment in search_audit.get("assessment_records", [])
+                        if assessment.get("candidate_id") == item.get("candidate_id")
+                    ),
+                    search_audit.get("assessments", {}).get(name, {}),
+                )
+                reasons = assessment.get("rejection_reasons", [])
+                if reasons:
+                    lines.append(
+                        f"  reason: {', '.join(reasons)}"
+                    )
 
     # ---------------------------------------------------------
     # FILES SKIPPED
@@ -482,6 +759,8 @@ async def ask_drive(
         ephemeral=False,
         thinking=True,
     )
+    question_marker, answer_marker = _qa_interaction_markers(interaction)
+    question_echo_sent = False
 
     try:
         # -----------------------------------------------------
@@ -517,6 +796,7 @@ async def ask_drive(
             question,
             documents,
             search_plan,
+            search_audit,
         )
 
         # -----------------------------------------------------
@@ -534,20 +814,18 @@ async def ask_drive(
         #    then send the answer as ordinary persistent messages.
         # -----------------------------------------------------
 
-        await interaction.followup.send(
+        await _send_marked_qa_message(
+            interaction,
             f"**Question:** {question}",
-            ephemeral=False,
+            question_marker,
         )
+        question_echo_sent = True
 
-        message_chunks = split_discord_message(
-            message
+        await _send_marked_qa_message(
+            interaction,
+            message,
+            answer_marker,
         )
-
-        for message_chunk in message_chunks:
-            await interaction.followup.send(
-                message_chunk,
-                ephemeral=False,
-            )
 
     except LocalLLMError as exc:
         """Handle failures from the local language model."""
@@ -556,11 +834,18 @@ async def ask_drive(
             repr(exc),
         )
 
-        await interaction.followup.send(
+        if not question_echo_sent:
+            await _send_marked_qa_message(
+                interaction,
+                f"**Question:** {question}",
+                question_marker,
+            )
+        await _send_marked_qa_message(
+            interaction,
             "⚠️ I couldn't answer your Drive question "
             "because the local AI model is unavailable "
             f"or misconfigured.\n\n**Details:** {exc}",
-            ephemeral=False,
+            answer_marker,
         )
 
     except DriveError as exc:
@@ -570,10 +855,17 @@ async def ask_drive(
             repr(exc),
         )
 
-        await interaction.followup.send(
+        if not question_echo_sent:
+            await _send_marked_qa_message(
+                interaction,
+                f"**Question:** {question}",
+                question_marker,
+            )
+        await _send_marked_qa_message(
+            interaction,
             "⚠️ I couldn't read your Google Drive.\n\n"
             f"**Details:** {exc}",
-            ephemeral=False,
+            answer_marker,
         )
 
     except Exception as exc:
@@ -585,12 +877,57 @@ async def ask_drive(
             repr(exc),
         )
 
-        await interaction.followup.send(
+        if not question_echo_sent:
+            await _send_marked_qa_message(
+                interaction,
+                f"**Question:** {question}",
+                question_marker,
+            )
+        await _send_marked_qa_message(
+            interaction,
             "⚠️ An unexpected error occurred while "
             "processing your Drive. Check the bot's "
             "console logs for details.",
-            ephemeral=False,
+            answer_marker,
         )
+
+
+@bot.tree.command(
+    name="cleanup24h",
+    description="Remove this bot's marked Q&A messages from the last 24 hours",
+)
+@app_commands.guild_only()
+async def cleanup24h(interaction: discord.Interaction):
+    """Clean recent Q&A pairs after an explicit Manage Messages check."""
+    user_permissions = getattr(interaction.user, "guild_permissions", None)
+    if not user_permissions or not user_permissions.manage_messages:
+        await interaction.response.send_message(
+            "You need the Manage Messages permission to run this cleanup.",
+            ephemeral=True,
+        )
+        return
+
+    channel = interaction.channel
+    if channel is None or not hasattr(channel, "history"):
+        await interaction.response.send_message(
+            "This command can only clean a server text channel.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    result = await _cleanup_channel_history(channel, bot.user.id)
+    if result["history_failed"]:
+        summary = "Could not inspect channel history; no messages were deleted."
+    else:
+        summary = (
+            "Cleanup finished for the last 24 hours: "
+            f"{result['responses_deleted']} bot response messages deleted, "
+            f"{result['questions_deleted']} accompanying question messages deleted, "
+            f"{result['skipped']} skipped, "
+            f"{result['failures']} deletion failures."
+        )
+    await interaction.followup.send(summary, ephemeral=True)
 
 
 @bot.tree.command(
