@@ -3,6 +3,12 @@
 All notable changes to this project will be documented in this file.
 ---
 
+## [0.1.3] - 2026-10-01
+
+### Documentation
+
+* Recorded the 0.1.3 documentation baseline; no application behavior changes are included in this release.
+
 ## [0.1.2] - 2026-09-28
 
 ### Fixed
