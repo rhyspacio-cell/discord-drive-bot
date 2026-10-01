@@ -13,7 +13,7 @@ from modules.evidence import (
 from modules.llm import answer_drive_question, generate_answer_from_evidence
 from modules.query_constraints import extract_query_constraints
 from bot import format_drive_answer
-from modules.coordination_aggregation import evaluate_specialized_handlers
+from modules.evidence_aggregation import evaluate_specialized_handlers
 
 
 def test_project_risk_assessments_rejects_vba_and_project_explorer_content(monkeypatch):
@@ -515,7 +515,8 @@ def test_authorization_answer_uses_direct_relationship_evidence(monkeypatch):
     assert "`PACIO_RESUME`" in displayed
 
 
-def test_unrelated_noise_document_never_becomes_a_reference(monkeypatch):
+def test_unrelated_noise_document_never_reaches_answer_llm(monkeypatch):
+    captured = {}
     question = "What is the planned activity date for John Smith?"
     plan = {"query_constraints": extract_query_constraints(question)}
     target_span = (
@@ -524,16 +525,11 @@ def test_unrelated_noise_document_never_becomes_a_reference(monkeypatch):
         "Activity Date: October 10, 2026"
     )
     claim = "John Smith's planned equipment inspection date is October 10, 2026."
-    monkeypatch.setattr(
-        "modules.llm.generate_local_response",
-        lambda _prompt: json.dumps({
-            "answer": claim,
-            "claims": [{
-                "claim": claim,
-                "evidence": [{"document_id": "target-1", "quote": target_span}],
-            }],
-        }),
-    )
+    def fake_generate(prompt):
+        captured["prompt"] = prompt
+        return claim
+
+    monkeypatch.setattr("modules.llm.generate_local_response", fake_generate)
     candidates = [
         {
             "name": "activity_record.docx",
@@ -559,9 +555,14 @@ def test_unrelated_noise_document_never_becomes_a_reference(monkeypatch):
         "empty": [],
     }
 
-    answer_drive_question(question, candidates, plan, audit)
+    answer = answer_drive_question(question, candidates, plan, audit)
 
-    assert audit["used"] == ["activity_record.docx"]
+    assert answer == claim
+    assert "activity_record.docx" in captured["prompt"]
+    assert target_span in captured["prompt"]
+    assert "unrelated_noise_document.docx" not in captured["prompt"]
+    assert audit["used"] == []
+    assert audit["reference_evidence"] == []
     assert audit["assessments"]["unrelated_noise_document.docx"]["eligible"] is False
 
 
@@ -595,7 +596,8 @@ def test_salary_without_explicit_evidence_does_not_create_references():
     assert audit["reference_evidence"] == []
 
 
-def test_uncited_answer_text_is_ignored(monkeypatch):
+def test_answer_llm_returns_plain_text_from_validated_evidence(monkeypatch):
+    captured = {}
     question = "What is the planned activity date for John Smith?"
     evidence_span = (
         "Person: John Smith\n"
@@ -603,16 +605,13 @@ def test_uncited_answer_text_is_ignored(monkeypatch):
         "Activity Date: October 10, 2026"
     )
     claim = "John Smith's planned equipment inspection date is October 10, 2026."
-    monkeypatch.setattr(
-        "modules.llm.generate_local_response",
-        lambda _prompt: json.dumps({
-            "answer": f"{claim} PACIO_RESUME confirms an unrelated project fact.",
-            "claims": [{
-                "claim": claim,
-                "evidence": [{"document_id": "activity-uncited-1", "quote": evidence_span}],
-            }],
-        }),
-    )
+    answer_text = f"{claim} PACIO_RESUME confirms an unrelated project fact."
+
+    def fake_generate(prompt):
+        captured["prompt"] = prompt
+        return answer_text
+
+    monkeypatch.setattr("modules.llm.generate_local_response", fake_generate)
     candidate = {
         "name": "activity_record.docx",
         "candidate_id": "activity-uncited-1",
@@ -623,10 +622,12 @@ def test_uncited_answer_text_is_ignored(monkeypatch):
 
     answer = answer_drive_question(question, [candidate], search_audit=audit)
 
-    assert answer == claim
-    assert "unrelated project fact" not in answer
-    assert audit["used"] == ["activity_record.docx"]
-    assert audit["reference_evidence"][0]["evidence_span"] == evidence_span
+    assert answer == answer_text
+    assert "VALIDATED EVIDENCE" in captured["prompt"]
+    assert evidence_span in captured["prompt"]
+    assert '"claims"' not in captured["prompt"]
+    assert audit["used"] == []
+    assert audit["reference_evidence"] == []
 
 
 def test_project_risk_paraphrases_have_deterministic_validated_provenance(monkeypatch):

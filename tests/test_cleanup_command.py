@@ -114,7 +114,7 @@ def test_old_bot_response_is_not_deleted():
     assert result["questions_deleted"] == 0
 
 
-def test_old_question_is_not_deleted_for_a_recent_response():
+def test_recent_single_submission_is_deleted_without_old_separate_question():
     old_question = marked_message(
         1,
         "question",
@@ -125,9 +125,9 @@ def test_old_question_is_not_deleted_for_a_recent_response():
     _, result = run_cleanup([old_question, recent_answer])
 
     assert not old_question.deleted
-    assert not recent_answer.deleted
-    assert result["responses_deleted"] == 0
-    assert result["skipped"] == 1
+    assert recent_answer.deleted
+    assert result["responses_deleted"] == 1
+    assert result["questions_deleted"] == 0
 
 
 def test_unrelated_user_message_before_unmarked_bot_message_remains():
@@ -142,7 +142,7 @@ def test_unrelated_user_message_before_unmarked_bot_message_remains():
     assert result["questions_deleted"] == 0
 
 
-def test_message_from_another_bot_remains_even_with_matching_marker():
+def test_explicit_provenance_is_authoritative_across_bot_delivery_authors():
     other_bot_question = FakeMessage(
         1,
         901,
@@ -158,9 +158,9 @@ def test_message_from_another_bot_remains_even_with_matching_marker():
 
     _, result = run_cleanup([other_bot_question, other_bot_answer])
 
-    assert not other_bot_question.deleted and not other_bot_answer.deleted
-    assert result["responses_deleted"] == 0
-    assert result["questions_deleted"] == 0
+    assert other_bot_question.deleted and other_bot_answer.deleted
+    assert result["responses_deleted"] == 1
+    assert result["questions_deleted"] == 1
 
 
 def test_unmarked_bot_authored_message_is_not_treated_as_a_qa_response():
@@ -442,3 +442,156 @@ def test_old_ask_drive_failure_is_not_deleted():
     assert not question.deleted and not failure.deleted
     assert result["responses_deleted"] == 0
     assert result["questions_deleted"] == 0
+
+
+def test_current_sender_marker_is_recognized_by_cleanup():
+    messages = []
+    interaction = SimpleNamespace(
+        id=700,
+        user=SimpleNamespace(id=USER_ID),
+        followup=SimpleNamespace(),
+        channel=SimpleNamespace(),
+    )
+
+    async def send(content, **_kwargs):
+        message = FakeMessage(len(messages) + 1, BOT_ID, content, is_bot=True)
+        messages.append(message)
+        return message
+
+    interaction.followup.send = AsyncMock(side_effect=send)
+    marker = bot_module._qa_interaction_markers(interaction)[1]
+    submission = bot_module.format_question_answer_submission("Q1", "A1")
+
+    asyncio.run(
+        bot_module._send_marked_qa_message(interaction, submission, marker)
+    )
+
+    sent_content = messages[0].content
+    assert sent_content.endswith(marker)
+    assert bot_module._decode_qa_marker(sent_content) == (700, USER_ID, "answer")
+    _, result = run_cleanup(messages)
+    assert messages[0].deleted
+    assert result["responses_deleted"] == 1
+
+
+def test_webhook_fallback_message_is_cleanup_eligible():
+    messages = []
+    interaction = SimpleNamespace(
+        id=700,
+        user=SimpleNamespace(id=USER_ID),
+        followup=SimpleNamespace(),
+    )
+
+    async def unavailable(_content, **_kwargs):
+        raise bot_module.discord.HTTPException(
+            response=SimpleNamespace(status=401, reason="Unauthorized"),
+            message="Invalid Webhook Token",
+        )
+
+    async def channel_send(content, **_kwargs):
+        message = FakeMessage(len(messages) + 1, BOT_ID, content, is_bot=True)
+        messages.append(message)
+        return message
+
+    interaction.followup.send = AsyncMock(side_effect=unavailable)
+    interaction.channel = SimpleNamespace(send=AsyncMock(side_effect=channel_send))
+    marker = bot_module._qa_interaction_markers(interaction)[1]
+
+    asyncio.run(
+        bot_module._send_marked_qa_message(
+            interaction,
+            bot_module.format_question_answer_submission("Q1", "A1"),
+            marker,
+        )
+    )
+
+    assert bot_module._decode_qa_marker(messages[0].content) == (700, USER_ID, "answer")
+    _, result = run_cleanup(messages)
+    assert messages[0].deleted
+    assert result["responses_deleted"] == 1
+
+
+def test_primary_and_all_continuations_are_cleanup_eligible():
+    messages = []
+    interaction = SimpleNamespace(
+        id=700,
+        user=SimpleNamespace(id=USER_ID),
+        followup=SimpleNamespace(),
+    )
+
+    async def record_message(content, **_kwargs):
+        message = FakeMessage(
+            len(messages) + 1,
+            BOT_ID,
+            content,
+            is_bot=True,
+        )
+        messages.append(message)
+        return message
+
+    interaction.followup.send = AsyncMock(side_effect=record_message)
+    interaction.channel = SimpleNamespace(
+        send=AsyncMock(side_effect=record_message),
+    )
+    marker = bot_module._qa_interaction_markers(interaction)[1]
+
+    asyncio.run(
+        bot_module._send_marked_qa_message(
+            interaction,
+            "Long answer " + ("x" * 5000),
+            marker,
+        )
+    )
+
+    assert len(messages) > 1
+    assert all(
+        bot_module._decode_qa_marker(message.content) == (700, USER_ID, "answer")
+        for message in messages
+    )
+    _, result = run_cleanup(messages)
+    assert all(message.deleted for message in messages)
+    assert result["responses_deleted"] == len(messages)
+
+
+def test_bulk_question_provenance_is_independent_and_cleanup_ignores_replies():
+    interaction = SimpleNamespace(id=700, user=SimpleNamespace(id=USER_ID))
+    messages = []
+    lifecycle_ids = []
+    for index, question in enumerate(("Q1", "Q2", "Q3")):
+        marker = bot_module._qa_interaction_markers(interaction, index)[1]
+        lifecycle_id, _, role = bot_module._decode_qa_marker(marker)
+        lifecycle_ids.append(lifecycle_id)
+        messages.append(FakeMessage(
+            index + 1,
+            BOT_ID,
+            bot_module._build_provenance_message(
+                bot_module.format_question_answer_submission(question, f"A{index + 1}"),
+                marker,
+            ),
+            is_bot=True,
+        ))
+    unrelated_reply = FakeMessage(4, USER_ID, "Unrelated reply", interaction_id=None)
+    unrelated_reply.reference = SimpleNamespace(message_id=1)
+    messages.append(unrelated_reply)
+
+    _, result = run_cleanup(messages)
+
+    assert len(set(lifecycle_ids)) == 3
+    assert all(message.deleted for message in messages[:3])
+    assert not unrelated_reply.deleted
+    assert result["responses_deleted"] == 3
+
+
+def test_bulk_empty_input_failure_response_has_cleanup_provenance():
+    interaction = SimpleNamespace(
+        id=700,
+        user=SimpleNamespace(id=USER_ID),
+        response=SimpleNamespace(defer=AsyncMock()),
+        followup=SimpleNamespace(send=AsyncMock()),
+        channel=SimpleNamespace(send=AsyncMock()),
+    )
+
+    asyncio.run(bot_module.ask_drive_bulk.callback(interaction, "\n   \n"))
+
+    sent_content = interaction.followup.send.await_args.args[0]
+    assert bot_module._decode_qa_marker(sent_content) == (700, USER_ID, "answer")

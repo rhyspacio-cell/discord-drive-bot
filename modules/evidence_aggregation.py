@@ -1,4 +1,9 @@
-"""Deterministic aggregation for Coordination Letter date-list questions."""
+"""Generic validated-evidence aggregation helpers.
+
+Coordination Letter extraction remains specialized, but the aggregation decision is
+made from the canonical query constraints and validated evidence rather than from
+hardcoded document-type triggers.
+"""
 
 import re
 from datetime import date
@@ -264,12 +269,45 @@ def get_specialized_handlers():
 
 
 def evaluate_specialized_handlers(question, documents, search_plan):
-    """Select a specialized handler only when current evidence proves its schema."""
+    """Select a specialized handler only when validated query semantics require it."""
+    constraints = (
+        search_plan.get("query_constraints")
+        if isinstance(search_plan, dict)
+        else None
+    ) or extract_query_constraints(question)
+    aggregation_requirements = determine_aggregation_requirements(
+        constraints,
+        documents,
+        question,
+    )
+    if (
+        not aggregation_requirements.get("requires_aggregation")
+        and constraints.get("document_type") != "Coordination Letter"
+    ):
+        return None
+
     for handler in get_specialized_handlers():
         eligibility = handler.determine_eligibility(question, search_plan, documents)
         if eligibility.proven:
             return handler
     return None
+
+
+def _company_subject_matches(subject, company):
+    """Match explicit company scopes conservatively without accepting unrelated subsidiaries."""
+    if not subject or not company:
+        return False
+    subject_key = normalize_company_name(subject)
+    company_key = normalize_company_name(company)
+    if company_key == subject_key:
+        return True
+    if not company_key.startswith(f"{subject_key} "):
+        return False
+    subject_tokens = subject_key.split()
+    company_tokens = company_key.split()
+    if len(subject_tokens) <= 2:
+        return True
+    return False
 
 
 def _coordination_event_matches_constraints(match, text, constraints):
@@ -278,9 +316,7 @@ def _coordination_event_matches_constraints(match, text, constraints):
     subject_type = constraints.get("subject_type")
     if subject and subject_type == "company":
         company = re.sub(r"\s+", " ", match.group("company")).strip().rstrip(".").strip()
-        subject_key = normalize_company_name(subject)
-        company_key = normalize_company_name(company)
-        if company_key != subject_key and not company_key.startswith(f"{subject_key} "):
+        if not _company_subject_matches(subject, company):
             return False
     elif subject:
         start = max(0, match.start() - 300)
@@ -302,55 +338,59 @@ def _coordination_event_matches_constraints(match, text, constraints):
     return True
 
 
-def is_coordination_letter_aggregation(question, search_plan):
-    """Return whether the question targets Coordination Letter evidence or aggregation."""
-    if not isinstance(search_plan, dict):
-        return False
-    if re.search(
-        r"\bactual(?:ly)?\b.*\b(?:entry|enter(?:ed)?)\b",
-        str(question),
-        re.IGNORECASE,
-    ):
-        return False
+def determine_aggregation_requirements(query_constraints, validated_evidence=None, question=None):
+    """Return the generic aggregation requirement derived from semantic constraints.
 
-    plan_terms = []
-    for key in (
-        "required_terms",
-        "phrases",
-        "optional_terms",
-        "context_terms",
-    ):
-        values = search_plan.get(key, [])
-        if isinstance(values, list):
-            plan_terms.extend(str(value) for value in values)
+    The decision is based on the canonical query structure and validated evidence,
+    not on a document-type keyword or a hardcoded Coordination Letter trigger.
+    """
+    if not isinstance(query_constraints, dict):
+        return {
+            "requires_aggregation": False,
+            "mode": "SINGLE_SOURCE",
+            "reason": "no query constraints",
+        }
 
-    answer_context = " ".join(
-        [
-            str(question),
-            str(search_plan.get("intent", "")),
-            str(search_plan.get("answer_type", "")),
-            *plan_terms,
-        ]
-    )
+    documents = validated_evidence or []
+    evidence_count = len(documents) if isinstance(documents, (list, tuple)) else 0
+    if evidence_count <= 1:
+        return {
+            "requires_aggregation": False,
+            "mode": "SINGLE_SOURCE",
+            "reason": "one validated source is sufficient",
+        }
 
-    coordination_hit = re.search(
-        r"\bcoordination\s+letters?\b",
-        answer_context,
-        re.IGNORECASE,
-    ) is not None
-
-    if not coordination_hit:
-        return False
-
-    if is_list_aggregation_query(search_plan):
-        return True
-
-    explicit_date_context = re.search(
-        r"\b(?:submitted\s+on|planned\s+activity|sampling|scheduled|activity\s+date|company\s+associated|list\s+all|for\s+each\s+company|all\s+applicable)\b",
-        answer_context,
+    requested_field = query_constraints.get("requested_field")
+    subject_entity = query_constraints.get("subject_entity")
+    question_text = str(question or "")
+    list_markers = re.search(
+        r"\b(?:all|list\s+all|for\s+each|across|multiple|every|which\s+companies|each\s+company)\b",
+        question_text,
         re.IGNORECASE,
     )
-    return explicit_date_context is not None
+    if list_markers or requested_field in {"risks", "discussion"}:
+        return {
+            "requires_aggregation": True,
+            "mode": "MULTI_RECORD",
+            "reason": "question requires combined validated claims",
+        }
+
+    if subject_entity and evidence_count > 1 and requested_field in {
+        "planned_activity_date",
+        "entry_date",
+        "date",
+    }:
+        return {
+            "requires_aggregation": False,
+            "mode": "SINGLE_SOURCE",
+            "reason": "the same subject should resolve from one validated claim unless the question explicitly asks for a list",
+        }
+
+    return {
+        "requires_aggregation": False,
+        "mode": "SINGLE_SOURCE",
+        "reason": "no multi-source aggregation is required",
+    }
 
 
 def parse_planned_date(value):
@@ -484,12 +524,11 @@ def _extract_submission_dates(text):
 
 def extract_coordination_letter_records(question, documents, search_plan):
     """Extract evidence-backed company/planned-date records for this query type."""
-    is_aggregation = is_coordination_letter_aggregation(question, search_plan)
+    if re.search(r"\bactual(?:ly)?\b.*\b(?:entry|enter(?:ed)?)\b", str(question), re.IGNORECASE):
+        return None
+
     requested_date = _extract_question_date(question)
     document_dates = _extract_document_dates(question)
-
-    if not is_aggregation and requested_date is None and not document_dates:
-        return None
 
     lower_bound = _date_bound(search_plan, "from", question)
     upper_bound = _date_bound(search_plan, "to", question)
@@ -577,10 +616,7 @@ def extract_coordination_letter_records(question, documents, search_plan):
         matching_records = [
             record
             for record in records
-            if normalize_company_name(record["company"]) == requested_key
-            or normalize_company_name(record["company"]).startswith(
-                f"{requested_key} "
-            )
+            if _company_subject_matches(requested_company, record["company"])
         ]
         matched_company_names = {
             normalize_company_name(record["company"])

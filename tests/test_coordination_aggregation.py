@@ -1,7 +1,7 @@
 import json
 from datetime import date, timedelta
 
-from modules.coordination_aggregation import (
+from modules.evidence_aggregation import (
     _coordination_event_matches_constraints,
     _explicit_company_scope,
     _planned_activity_matches,
@@ -300,7 +300,7 @@ def test_ordinary_question_keeps_llm_answer_path(monkeypatch):
         ordinary_plan,
     )
 
-    assert "traceable evidence" in answer.lower()
+    assert answer == "Existing LLM answer."
     assert len(generated_prompts) == 1
 
 
@@ -828,7 +828,8 @@ def test_legacy_used_names_do_not_become_references(monkeypatch):
     assert "`PACIO_RESUME`" in displayed
 
 
-def test_pacio_resume_cannot_be_reference_without_claim_support(monkeypatch):
+def test_pacio_resume_is_excluded_from_validated_answer_context(monkeypatch):
+    captured = {}
     question = "What is the planned activity date for John Smith?"
     plan = {
         "query_constraints": {
@@ -845,16 +846,11 @@ def test_pacio_resume_cannot_be_reference_without_claim_support(monkeypatch):
         "Activity Date: October 10, 2026"
     )
     claim = "John Smith's planned equipment inspection date is October 10, 2026."
-    monkeypatch.setattr(
-        "modules.llm.generate_local_response",
-        lambda _prompt: json.dumps({
-            "answer": claim,
-            "claims": [{
-                "claim": claim,
-                "evidence": [{"document_id": "activity-1", "quote": evidence_span}],
-            }],
-        }),
-    )
+    def fake_generate(prompt):
+        captured["prompt"] = prompt
+        return claim
+
+    monkeypatch.setattr("modules.llm.generate_local_response", fake_generate)
     candidates = [
         {
             "name": "activity_record.docx",
@@ -879,10 +875,11 @@ def test_pacio_resume_cannot_be_reference_without_claim_support(monkeypatch):
 
     answer = answer_drive_question(question, candidates, plan, audit)
     displayed = format_drive_answer(answer, audit)
-    references = displayed.split("**Files analyzed but not used**")[0]
-
-    assert "`activity_record.docx`" in references
-    assert "`PACIO_RESUME`" not in references
+    assert answer == claim
+    assert "activity_record.docx" in captured["prompt"]
+    assert evidence_span in captured["prompt"]
+    assert "PACIO_RESUME" not in captured["prompt"]
     assert "`PACIO_RESUME`" in displayed
-    assert audit["used"] == ["activity_record.docx"]
     assert audit["assessments"]["PACIO_RESUME"]["eligible"] is False
+    assert audit["used"] == []
+    assert audit["reference_evidence"] == []

@@ -86,7 +86,7 @@ def test_answer_prompt_distinguishes_authorized_person_from_approver(monkeypatch
     assert "approver, supervisor, signatory, reviewer, or witness" in instructions
     assert "Do not infer that a person has an authorization" in instructions
     assert re.search(r"rhys\s+(?:john\s+)?pacio", instructions, re.IGNORECASE) is None
-    assert "traceable evidence" in answer.lower()
+    assert answer == expected_answer
 
 
 def test_authorization_search_planner_prompt_is_generic_and_preserves_anchor(monkeypatch):

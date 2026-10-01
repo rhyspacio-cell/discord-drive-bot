@@ -1,5 +1,4 @@
 import json
-import inspect
 import re
 from urllib import request as urllib_request
 
@@ -9,7 +8,7 @@ from modules.config import (
     MAX_ANSWER_CHARS,
     MAX_TOTAL_CHARS,
 )
-from modules.coordination_aggregation import (
+from modules.evidence_aggregation import (
     evaluate_specialized_handlers,
     extract_coordination_letter_records,
     format_coordination_letter_records,
@@ -28,9 +27,6 @@ from modules.query_constraints import extract_query_constraints
 
 class LocalLLMError(RuntimeError):
     """Raised when the local Ollama model cannot complete a request."""
-
-
-UNVERIFIED_ANSWER = "I couldn't provide an answer with traceable evidence."
 
 
 def generate_local_response(prompt: str, response_format=None) -> str:
@@ -384,97 +380,6 @@ def _answer_authorization_question(evidence, constraints, search_audit):
     return answer
 
 
-def _claim_reference_records(response, documents):
-    """Accept model provenance only when claims quote validator-produced spans."""
-    try:
-        payload = json.loads(response)
-    except (TypeError, json.JSONDecodeError):
-        return UNVERIFIED_ANSWER, []
-    if not isinstance(payload, dict) or not isinstance(payload.get("answer"), str):
-        return UNVERIFIED_ANSWER, []
-
-    answer = payload["answer"].strip()
-    claims = payload.get("claims")
-    if not answer or not isinstance(claims, list):
-        return UNVERIFIED_ANSWER, []
-    if not claims:
-        if re.search(
-            r"\b(?:couldn't|cannot|can't|not enough|not explicitly|not stated|no information|unable to)\b",
-            answer,
-            re.IGNORECASE,
-        ):
-            return answer, []
-        return UNVERIFIED_ANSWER, []
-
-    documents_by_id = {
-        _validated_document_id(document): document
-        for document in documents
-        if _validated_document_id(document)
-    }
-    records = []
-    final_claims = []
-    invalid_claim = False
-    for item in claims:
-        if not isinstance(item, dict):
-            invalid_claim = True
-            continue
-        claim = item.get("claim")
-        evidence_items = item.get("evidence")
-        if (
-            not isinstance(claim, str)
-            or not claim.strip()
-            or not isinstance(evidence_items, list)
-        ):
-            invalid_claim = True
-            continue
-        claim_records = []
-        for evidence_item in evidence_items:
-            if not isinstance(evidence_item, dict):
-                continue
-            document_id = evidence_item.get("document_id")
-            quote = evidence_item.get("quote")
-            document = documents_by_id.get(document_id)
-            assessment = document.get("_evidence_assessment") if document else None
-            validated_span = getattr(assessment, "evidence_span", None)
-            if (
-                not isinstance(quote, str)
-                or not quote.strip()
-                or not validated_span
-                or quote not in validated_span
-                or quote not in document.get("text", "")
-            ):
-                continue
-            claim_records.append({
-                "document_id": document_id,
-                "file_name": document["name"],
-                "evidence_span": validated_span,
-                "evidence_quote": quote,
-                "claim": claim,
-                "supports_final_claim": True,
-                "validation_reason": assessment.validation_reason,
-            })
-        if not claim_records:
-            invalid_claim = True
-        else:
-            final_claims.append(claim.strip())
-        records.extend(claim_records)
-    if invalid_claim or not records:
-        return UNVERIFIED_ANSWER, []
-    return " ".join(final_claims), records
-
-
-def _generate_claim_response(prompt):
-    parameters = inspect.signature(generate_local_response).parameters.values()
-    supports_format = any(
-        parameter.name == "response_format"
-        or parameter.kind is inspect.Parameter.VAR_KEYWORD
-        for parameter in parameters
-    )
-    if supports_format:
-        return generate_local_response(prompt, response_format="json")
-    return generate_local_response(prompt)
-
-
 def answer_drive_question(
     question: str,
     documents,
@@ -644,7 +549,6 @@ def generate_answer_from_evidence(
             "document_name": document["name"],
             "document_id": _validated_document_id(document),
             "text": assessment.evidence_span,
-            "claim": assessment.to_dict(),
         })
     assert answer_context_documents, "Answer context cannot be empty."
     assert all(
@@ -703,14 +607,8 @@ You are answering a question about one person's
 Google Drive for that person.
 
 Answer the user's question directly and concisely.
-Return only a JSON object with this shape:
-{{"answer":"...","claims":[{{"claim":"one factual sentence to return to the user","evidence":[{{"document_id":"...","quote":"an exact excerpt from that document's validated evidence span"}}]}}]}}
-Every factual statement must appear as a claim with at least one exact evidence
-excerpt. The application renders the final answer from validated claims and
-ignores uncited free-form answer text. Use only the DOCUMENT_ID and EVIDENCE
-SPAN supplied below. Do not cite filenames or invent document IDs. If evidence
-is insufficient, say so in answer and return an empty claims list. The
-application, not you, determines which files are references.
+Use only the supplied validated evidence to answer. If it does not contain
+enough information, say so clearly.
 
 Original user question discipline:
 - Original user question is the controlling instruction.
@@ -791,7 +689,4 @@ Here are the files:
             "Set LOCAL_LLM_MODEL in your .env file."
         )
 
-    response = _generate_claim_response(prompt)
-    answer, reference_records = _claim_reference_records(response, documents)
-    _set_reference_evidence(search_audit, reference_records)
-    return answer
+    return generate_local_response(prompt)

@@ -304,23 +304,7 @@ def test_inspection_ambiguity_ignores_reporting_and_assessment_dates(monkeypatch
 
     def fake_generate(prompt):
         captured["prompt"] = prompt
-        claim = "The equipment inspection is scheduled for October 10, 2026."
-        return json.dumps({
-            "answer": claim,
-            "claims": [{
-                "claim": claim,
-                "evidence": [
-                    {
-                        "document_id": "status-1",
-                        "quote": "Reporting Date: September 15, 2026\nThe team plans to inspect the Cebu Port equipment on October 10, 2026.",
-                    },
-                    {
-                        "document_id": "risk-1",
-                        "quote": "Assessment Date: September 25, 2026\nEquipment inspection is planned for October 10, 2026.",
-                    },
-                ],
-            }],
-        })
+        return "The equipment inspection is scheduled for October 10, 2026."
 
     monkeypatch.setattr("modules.llm.generate_local_response", fake_generate)
     question = "When is the equipment inspection scheduled?"
@@ -800,25 +784,7 @@ def test_prompt_requires_all_supplied_documents_and_question_control(monkeypatch
         captured["prompt"] = prompt
         ostrea_claim = "Ostrea Mineral Laboratories Inc. entered IPI on April 14, 2026."
         krypton_claim = "Krypton International Resources Inc. entered IPI on June 25, 2026."
-        return json.dumps({
-            "answer": f"{ostrea_claim} {krypton_claim}",
-            "claims": [
-                {
-                    "claim": ostrea_claim,
-                    "evidence": [{
-                        "document_id": "letter-a",
-                        "quote": "Coordination letter dated April 14, 2026. Ostrea Mineral Laboratories Inc. entered IPI on April 14, 2026.",
-                    }],
-                },
-                {
-                    "claim": krypton_claim,
-                    "evidence": [{
-                        "document_id": "letter-b",
-                        "quote": "Coordination letter dated June 25, 2026. Krypton International Resources Inc. entered IPI on June 25, 2026.",
-                    }],
-                },
-            ],
-        })
+        return f"{ostrea_claim} {krypton_claim}"
 
     monkeypatch.setattr(
         "modules.llm.generate_local_response",
@@ -886,25 +852,7 @@ def test_prompt_injection_does_not_override_original_question(monkeypatch):
         captured["prompt"] = prompt
         ostrea_claim = "Ostrea Mineral Laboratories Inc. entered IPI on April 14, 2026."
         krypton_claim = "Krypton International Resources Inc. entered IPI on June 25, 2026."
-        return json.dumps({
-            "answer": f"{ostrea_claim} {krypton_claim}",
-            "claims": [
-                {
-                    "claim": ostrea_claim,
-                    "evidence": [{
-                        "document_id": "letter-a",
-                        "quote": "Coordination letter dated April 14, 2026. Ostrea Mineral Laboratories Inc. entered IPI on April 14, 2026.",
-                    }],
-                },
-                {
-                    "claim": krypton_claim,
-                    "evidence": [{
-                        "document_id": "letter-b",
-                        "quote": "Coordination letter dated June 25, 2026. Krypton International Resources Inc. entered IPI on June 25, 2026.",
-                    }],
-                },
-            ],
-        })
+        return f"{ostrea_claim} {krypton_claim}"
 
     monkeypatch.setattr(
         "modules.llm.generate_local_response",

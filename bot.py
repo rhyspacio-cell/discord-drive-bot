@@ -117,19 +117,88 @@ def _encode_qa_marker(interaction_id, user_id, role):
     return f"{_QA_MARKER_START}{hidden_bits}{_QA_MARKER_END}"
 
 
-def _qa_interaction_markers(interaction):
+def _derive_question_lifecycle_id(interaction, question_index=0):
+    """Return a stable per-question lifecycle ID for bulk messages.
+
+    The payload still fits in the existing hidden marker format while allowing
+    each bulk question to be grouped independently from the parent interaction.
+    """
+    base_id = int(getattr(interaction, "id", 0) or 0)
+    if question_index is None:
+        return base_id
+    return ((base_id << 16) | (question_index + 1)) & ((1 << 64) - 1)
+
+
+def _qa_interaction_markers(interaction, question_index=None):
+    lifecycle_id = _derive_question_lifecycle_id(interaction, question_index)
     return (
-        _encode_qa_marker(interaction.id, interaction.user.id, "question"),
-        _encode_qa_marker(interaction.id, interaction.user.id, "answer"),
+        _encode_qa_marker(lifecycle_id, interaction.user.id, "question"),
+        _encode_qa_marker(lifecycle_id, interaction.user.id, "answer"),
     )
 
 
-async def _send_marked_qa_message(interaction, text, marker):
-    for chunk in split_discord_message(text, limit=1800):
-        await interaction.followup.send(
-            chunk + marker,
+def _build_provenance_message(text, marker):
+    return text + marker
+
+
+async def _send_primary_qa_message(interaction, content):
+    """Send a standalone Q&A message without reply/reference semantics."""
+    try:
+        return await interaction.followup.send(
+            content,
             ephemeral=False,
         )
+    except discord.HTTPException as exc:
+        status_code = getattr(exc, "status", None)
+        api_error_code = getattr(exc, "code", None)
+        if status_code not in {401} and api_error_code not in {50027}:
+            raise
+        channel = getattr(interaction, "channel", None)
+        if channel is None:
+            raise
+        return await channel.send(content)
+
+
+async def _send_continuation_qa_message(interaction, content, previous_message):
+    """Send a continuation chunk using the supported message reply API.
+
+    Webhook sends do not accept reply metadata in this installed Discord.py
+    version, so continuation delivery must use the message/channel API instead.
+    """
+    if previous_message is None:
+        return await _send_primary_qa_message(interaction, content)
+
+    try:
+        return await previous_message.reply(content)
+    except (AttributeError, TypeError, discord.HTTPException):
+        channel = getattr(interaction, "channel", None)
+        if channel is None:
+            raise
+        return await channel.send(content, reference=previous_message)
+
+
+async def _send_marked_qa_message(interaction, text, marker, *, previous_message=None):
+    """Send a Q&A chunk sequence with reply chaining only on continuations.
+
+    The first chunk for each logical question is always a standalone message.
+    Only follow-on chunks for the same question may reference the immediately
+    preceding message. This keeps the logic explicit and avoids leaking reply
+    parameters into the primary webhook path.
+    """
+    chunks = split_discord_message(text, limit=1800)
+    last_message = previous_message
+    for index, chunk in enumerate(chunks):
+        content = _build_provenance_message(chunk, marker)
+        if index == 0:
+            sent_message = await _send_primary_qa_message(interaction, content)
+        else:
+            sent_message = await _send_continuation_qa_message(
+                interaction,
+                content,
+                last_message,
+            )
+        last_message = sent_message
+    return last_message
 
 
 def _decode_qa_marker(content):
@@ -161,12 +230,147 @@ def _decode_qa_marker(content):
     )
 
 
+def parse_bulk_questions(raw_questions):
+    """Split a bulk question payload into independent questions.
+
+    Blank lines are ignored and each non-empty line is treated as a single
+    question while preserving the original wording aside from stripping outer
+    whitespace.
+    """
+    if raw_questions is None:
+        return []
+
+    questions = []
+    for line in str(raw_questions).splitlines():
+        question = line.strip()
+        if question:
+            questions.append(question)
+    return questions
+
+
+def format_question_answer_submission(question: str, answer: str):
+    """Format a single logical question+answer submission for Discord."""
+    normalized_question = question.strip()
+    normalized_answer = answer.strip()
+    return (
+        f"**Question:** {normalized_question}\n\n"
+        f"**Answer:** {normalized_answer}"
+    )
+
+
+async def _process_drive_question(
+    interaction,
+    question,
+    *,
+    question_index=None,
+    previous_message=None,
+):
+    """Run the existing single-question Drive QA pipeline for one logical question."""
+    _, answer_marker = _qa_interaction_markers(interaction, question_index)
+
+    try:
+        search_plan = await asyncio.to_thread(
+            interpret_search_request,
+            question,
+        )
+
+        documents, _, search_audit = (
+            await asyncio.to_thread(
+                collect_drive_documents,
+                interaction.user.id,
+                question,
+                search_plan,
+            )
+        )
+
+        answer = await asyncio.to_thread(
+            answer_drive_question,
+            question,
+            documents,
+            search_plan,
+            search_audit,
+        )
+
+        message = format_drive_answer(
+            answer,
+            search_audit,
+        )
+        submission = format_question_answer_submission(question, message)
+
+        await _send_marked_qa_message(
+            interaction,
+            submission,
+            answer_marker,
+            previous_message=previous_message,
+        )
+
+    except LocalLLMError as exc:
+        print(
+            "[LLM ERROR]",
+            repr(exc),
+        )
+
+        submission = format_question_answer_submission(
+            question,
+            "⚠️ I couldn't answer your Drive question "
+            "because the local AI model is unavailable "
+            f"or misconfigured.\n\n**Details:** {exc}",
+        )
+        await _send_marked_qa_message(
+            interaction,
+            submission,
+            answer_marker,
+            previous_message=previous_message,
+        )
+
+    except DriveError as exc:
+        print(
+            "[DRIVE ERROR]",
+            repr(exc),
+        )
+
+        submission = format_question_answer_submission(
+            question,
+            "⚠️ I couldn't read your Google Drive.\n\n"
+            f"**Details:** {exc}",
+        )
+        await _send_marked_qa_message(
+            interaction,
+            submission,
+            answer_marker,
+            previous_message=previous_message,
+        )
+
+    except Exception as exc:
+        print(
+            "[UNEXPECTED ERROR]",
+            "ask_drive",
+            type(exc).__name__,
+            repr(exc),
+        )
+
+        submission = format_question_answer_submission(
+            question,
+            "⚠️ An unexpected error occurred while "
+            "processing your Drive. Check the bot's "
+            "console logs for details.",
+        )
+        await _send_marked_qa_message(
+            interaction,
+            submission,
+            answer_marker,
+            previous_message=previous_message,
+        )
+
+
 def _is_in_time_window(message, cutoff, now):
     created_at = getattr(message, "created_at", None)
     if created_at is None:
         return False
     if created_at.tzinfo is None:
         created_at = created_at.replace(tzinfo=timezone.utc)
+    else:
+        created_at = created_at.astimezone(timezone.utc)
     return cutoff <= created_at <= now
 
 
@@ -175,7 +379,8 @@ def _legacy_ask_drive_marker(message):
         getattr(message, "interaction_metadata", None)
         or getattr(message, "interaction", None)
     )
-    if getattr(metadata, "name", None) not in {"ask-drive", "/ask-drive"}:
+    metadata_name = getattr(metadata, "name", None)
+    if metadata_name not in {"ask-drive", "/ask-drive", "ask-drive-bulk", "/ask-drive-bulk"}:
         return None
     interaction_id = getattr(metadata, "id", None)
     metadata_user = getattr(metadata, "user", None)
@@ -190,6 +395,62 @@ def _legacy_ask_drive_marker(message):
     return int(interaction_id), int(user_id), role
 
 
+def _has_qa_marker(content):
+    return isinstance(content, str) and (
+        _QA_MARKER_START in content or _QA_MARKER_END in content
+    )
+
+
+def _cleanup_diagnostic(message, now, cutoff, marker, legacy_marker, match, reason):
+    created_at = getattr(message, "created_at", None)
+    if created_at is not None and created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    elif created_at is not None:
+        created_at = created_at.astimezone(timezone.utc)
+    age_seconds = (
+        int((now - created_at).total_seconds())
+        if created_at is not None
+        else None
+    )
+    author = getattr(message, "author", None)
+    metadata = (
+        getattr(message, "interaction_metadata", None)
+        or getattr(message, "interaction", None)
+    )
+    reference = getattr(message, "reference", None)
+    parsed = marker or legacy_marker
+    lifecycle_id, user_id, role = parsed or (None, None, None)
+    command = (
+        "ask-drive/ask-drive-bulk (marker namespace; command not encoded)"
+        if marker is not None
+        else getattr(metadata, "name", None)
+    )
+    message_id = getattr(message, "id", "unknown")
+    print(
+        "CLEANUP_CHECK"
+        f" message={message_id}"
+        f" author_id={getattr(author, 'id', None)}"
+        f" author_bot={getattr(author, 'bot', None)}"
+        f" created_at_utc={created_at.isoformat() if created_at else None}"
+        f" age_seconds={age_seconds}"
+        f" content_length={len(getattr(message, 'content', '') or '')}"
+        f" has_provenance_marker={_has_qa_marker(getattr(message, 'content', ''))}"
+        f" parsed_provenance={parsed}"
+        f" provenance_command={command}"
+        f" provenance_question_id={lifecycle_id}"
+        f" provenance_user_id={user_id}"
+        f" provenance_message_role={role}"
+        f" interaction_id={getattr(metadata, 'id', None)}"
+        f" is_reply={reference is not None}"
+        f" reference_message_id={getattr(reference, 'message_id', None)}"
+        f" now_utc={now.isoformat()}"
+        f" cutoff_utc={cutoff.isoformat()}"
+        f" within_window={created_at is not None and cutoff <= created_at <= now}"
+        f" cleanup_match={match}"
+        f" cleanup_skip_reason={reason}"
+    )
+
+
 def _find_qna_cleanup_groups(messages, bot_user_id, cutoff, now):
     recent_messages = [
         message
@@ -200,13 +461,23 @@ def _find_qna_cleanup_groups(messages, bot_user_id, cutoff, now):
 
     for message in recent_messages:
         author = getattr(message, "author", None)
-        if getattr(author, "id", None) != bot_user_id:
+        content = getattr(message, "content", "")
+        marker_present = _has_qa_marker(content)
+        marker = _decode_qa_marker(content)
+        legacy_marker = None
+        if marker is None and not marker_present and getattr(author, "id", None) == bot_user_id:
+            legacy_marker = _legacy_ask_drive_marker(message)
+        parsed = marker or legacy_marker
+        if parsed is None:
+            reason = "invalid_provenance_marker" if marker_present else "missing_provenance"
+            _cleanup_diagnostic(message, now, cutoff, None, None, False, reason)
             continue
-        marker = _decode_qa_marker(getattr(message, "content", ""))
-        if marker is None:
-            marker = _legacy_ask_drive_marker(message)
-            if marker is None:
-                continue
+        if marker is None and getattr(author, "id", None) != bot_user_id:
+            _cleanup_diagnostic(message, now, cutoff, None, legacy_marker, False, "legacy_author_mismatch")
+            continue
+
+        _cleanup_diagnostic(message, now, cutoff, marker, legacy_marker, True, None)
+        marker = parsed
         interaction_id, user_id, role = marker
         group = groups.setdefault(
             (interaction_id, user_id),
@@ -215,12 +486,7 @@ def _find_qna_cleanup_groups(messages, bot_user_id, cutoff, now):
         group["questions" if role == "question" else "answers"].append(message)
 
     paired_groups = []
-    skipped = 0
     for (interaction_id, user_id), group in groups.items():
-        if not group["answers"]:
-            skipped += len(group["answers"]) + len(group["questions"])
-            continue
-
         question_messages = list(group["questions"])
         for message in recent_messages:
             author = getattr(message, "author", None)
@@ -236,16 +502,12 @@ def _find_qna_cleanup_groups(messages, bot_user_id, cutoff, now):
         question_messages = list({
             message.id: message for message in question_messages
         }.values())
-        if not question_messages:
-            skipped += len(group["answers"])
-            continue
-
         paired_groups.append({
             "answers": group["answers"],
             "questions": question_messages,
         })
 
-    return paired_groups, skipped
+    return paired_groups, 0
 
 
 async def _cleanup_channel_history(channel, bot_user_id, now=None):
@@ -253,6 +515,8 @@ async def _cleanup_channel_history(channel, bot_user_id, now=None):
     now = now or discord.utils.utcnow()
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
+    else:
+        now = now.astimezone(timezone.utc)
     cutoff = now - timedelta(hours=24)
 
     try:
@@ -289,6 +553,8 @@ async def _cleanup_channel_history(channel, bot_user_id, now=None):
             try:
                 await message.delete()
                 responses_deleted += 1
+            except discord.NotFound:
+                skipped += 1
             except Exception:
                 failures += 1
                 skipped += len(group["answers"]) - index - 1
@@ -302,6 +568,8 @@ async def _cleanup_channel_history(channel, bot_user_id, now=None):
             try:
                 await message.delete()
                 questions_deleted += 1
+            except discord.NotFound:
+                skipped += 1
             except Exception:
                 failures += 1
 
@@ -735,160 +1003,47 @@ async def ask_drive(
     interaction: discord.Interaction,
     question: str,
 ):
-    """Answer a user's question using relevant Google Drive files.
-
-    Processing is performed in several stages:
-
-    1. Interpret the natural-language question into a search plan.
-    2. Search the user's connected Google Drive.
-    3. Extract text from candidate files.
-    4. Rank and filter the extracted documents.
-    5. Send the selected documents to the local LLM.
-    6. Format the generated answer together with the Drive audit.
-    7. Post the original question and the answer as visible channel messages,
-       splitting long content into Discord-safe chunks when necessary.
-
-    CPU-bound or blocking Drive/LLM operations are executed in worker
-    threads so that they do not block Discord's asynchronous event loop.
-
-    Args:
-        interaction: Discord interaction containing the user and question.
-        question: Natural-language question to answer using Drive content.
-    """
+    """Answer a user's question using relevant Google Drive files."""
     await interaction.response.defer(
         ephemeral=False,
         thinking=True,
     )
-    question_marker, answer_marker = _qa_interaction_markers(interaction)
-    question_echo_sent = False
+    await _process_drive_question(interaction, question)
 
-    try:
-        # -----------------------------------------------------
-        # 1. Convert the question into a structured search plan.
-        # -----------------------------------------------------
 
-        search_plan = await asyncio.to_thread(
-            interpret_search_request,
+@bot.tree.command(
+    name="ask-drive-bulk",
+    description="Ask multiple Drive questions in one command",
+)
+@app_commands.describe(
+    questions="One or more questions, separated by new lines",
+)
+async def ask_drive_bulk(
+    interaction: discord.Interaction,
+    questions: str,
+):
+    """Process each non-empty line as an independent Drive question."""
+    await interaction.response.defer(
+        ephemeral=False,
+        thinking=True,
+    )
+
+    parsed_questions = parse_bulk_questions(questions)
+    if not parsed_questions:
+        _, answer_marker = _qa_interaction_markers(interaction)
+        await _send_marked_qa_message(
+            interaction,
+            "No valid questions were provided. Please enter at least one non-empty question.",
+            answer_marker,
+        )
+        return
+
+    for index, question in enumerate(parsed_questions):
+        await _process_drive_question(
+            interaction,
             question,
-        )
-
-        # -----------------------------------------------------
-        # 2. Search Drive, extract relevant files, and collect
-        #    an audit of what happened to each candidate.
-        # -----------------------------------------------------
-
-        documents, _, search_audit = (
-            await asyncio.to_thread(
-                collect_drive_documents,
-                interaction.user.id,
-                question,
-                search_plan,
-            )
-        )
-
-        # -----------------------------------------------------
-        # 3. Ask the local LLM to answer using only the selected
-        #    Drive documents.
-        # -----------------------------------------------------
-
-        answer = await asyncio.to_thread(
-            answer_drive_question,
-            question,
-            documents,
-            search_plan,
-            search_audit,
-        )
-
-        # -----------------------------------------------------
-        # 4. Combine the LLM answer with the factual Python-
-        #    generated file audit.
-        # -----------------------------------------------------
-
-        message = format_drive_answer(
-            answer,
-            search_audit,
-        )
-
-        # -----------------------------------------------------
-        # 5. Post the original question visibly in the channel,
-        #    then send the answer as ordinary persistent messages.
-        # -----------------------------------------------------
-
-        await _send_marked_qa_message(
-            interaction,
-            f"**Question:** {question}",
-            question_marker,
-        )
-        question_echo_sent = True
-
-        await _send_marked_qa_message(
-            interaction,
-            message,
-            answer_marker,
-        )
-
-    except LocalLLMError as exc:
-        """Handle failures from the local language model."""
-        print(
-            "[LLM ERROR]",
-            repr(exc),
-        )
-
-        if not question_echo_sent:
-            await _send_marked_qa_message(
-                interaction,
-                f"**Question:** {question}",
-                question_marker,
-            )
-        await _send_marked_qa_message(
-            interaction,
-            "⚠️ I couldn't answer your Drive question "
-            "because the local AI model is unavailable "
-            f"or misconfigured.\n\n**Details:** {exc}",
-            answer_marker,
-        )
-
-    except DriveError as exc:
-        """Handle failures while accessing or processing Google Drive."""
-        print(
-            "[DRIVE ERROR]",
-            repr(exc),
-        )
-
-        if not question_echo_sent:
-            await _send_marked_qa_message(
-                interaction,
-                f"**Question:** {question}",
-                question_marker,
-            )
-        await _send_marked_qa_message(
-            interaction,
-            "⚠️ I couldn't read your Google Drive.\n\n"
-            f"**Details:** {exc}",
-            answer_marker,
-        )
-
-    except Exception as exc:
-        """Handle unexpected failures without exposing internals to Discord."""
-        print(
-            "[UNEXPECTED ERROR]",
-            "ask_drive",
-            type(exc).__name__,
-            repr(exc),
-        )
-
-        if not question_echo_sent:
-            await _send_marked_qa_message(
-                interaction,
-                f"**Question:** {question}",
-                question_marker,
-            )
-        await _send_marked_qa_message(
-            interaction,
-            "⚠️ An unexpected error occurred while "
-            "processing your Drive. Check the bot's "
-            "console logs for details.",
-            answer_marker,
+            question_index=index,
+            previous_message=None,
         )
 
 

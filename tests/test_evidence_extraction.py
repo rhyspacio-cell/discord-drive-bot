@@ -77,15 +77,12 @@ def test_docx_table_text_reaches_evidence_assessment(monkeypatch):
     assert "Equipment Inspection" in text
     assert "October 10, 2026" in text
     assert documents[0]["text"] == text
-    assessment = audit["assessment_records"][0]
-    assert assessment["file_id"] == "drive-doc-1"
-    assert assessment["candidate_id"] == "drive-doc-1"
-    assert assessment["extraction_status"] == ExtractionStatus.SUCCESS.value
-    assert assessment["extracted_char_count"] == len(text)
-    assert assessment["extracted_text_available"] is True
-    assert assessment["subject_match"] is True
-    assert assessment["requested_field_match"] is True
-    assert assessment["eligible"] is True
+    diagnostic = audit["candidate_diagnostics"][0]
+    assert diagnostic["file_id"] == "drive-doc-1"
+    assert diagnostic["candidate_id"] == "drive-doc-1"
+    assert diagnostic["extraction_status"] == ExtractionStatus.SUCCESS.value
+    assert diagnostic["extracted_char_count"] == len(text)
+    assert diagnostic["extracted_text_available"] is True
 
 
 def test_empty_extraction_is_distinct_and_never_reaches_answer_llm(monkeypatch):
@@ -107,8 +104,8 @@ def test_empty_extraction_is_distinct_and_never_reaches_answer_llm(monkeypatch):
     )
 
     assert documents == []
-    assert audit["assessment_records"][0]["extraction_status"] == ExtractionStatus.EMPTY.value
-    assert audit["assessment_records"][0]["extracted_char_count"] == 0
+    assert audit["candidate_diagnostics"][0]["extraction_status"] == ExtractionStatus.EMPTY.value
+    assert audit["candidate_diagnostics"][0]["extracted_char_count"] == 0
     assert "couldn't read" in answer.lower()
 
 
@@ -120,11 +117,8 @@ def test_extraction_exception_is_distinct_and_keeps_error(monkeypatch):
 
     assert documents == []
     diagnostic = audit["candidate_diagnostics"][0]
-    assessment = audit["assessment_records"][0]
     assert diagnostic["extraction_status"] == ExtractionStatus.FAILURE.value
     assert "synthetic DOCX parse failure" in diagnostic["extraction_error"]
-    assert assessment["extraction_status"] == ExtractionStatus.FAILURE.value
-    assert assessment["extraction_error"] == diagnostic["extraction_error"]
 
     monkeypatch.setattr(
         "modules.llm.generate_local_response",
@@ -179,10 +173,9 @@ def test_short_successful_document_is_not_rejected_for_length(monkeypatch):
     )
 
     assert documents[0]["text"] == short_text
-    assessment = audit["assessment_records"][0]
-    assert assessment["extraction_status"] == ExtractionStatus.SUCCESS.value
-    assert assessment["extracted_char_count"] == len(short_text)
-    assert assessment["eligible"] is True
+    diagnostic = audit["candidate_diagnostics"][0]
+    assert diagnostic["extraction_status"] == ExtractionStatus.SUCCESS.value
+    assert diagnostic["extracted_char_count"] == len(short_text)
 
 
 def test_representative_is_not_bound_as_activity_subject():
@@ -251,7 +244,7 @@ def test_duplicate_filenames_keep_separate_drive_id_assessments(monkeypatch):
 
     assert len(documents) == 2
     assert {doc["file_id"] for doc in documents} == {"drive-id-a", "drive-id-b"}
-    assert {record["file_id"] for record in audit["assessment_records"]} == {
+    assert {record["file_id"] for record in audit["candidate_diagnostics"]} == {
         "drive-id-a",
         "drive-id-b",
     }
@@ -274,10 +267,7 @@ def test_unsupported_candidate_has_status_and_never_becomes_evidence():
 
     assert documents == []
     diagnostic = audit["candidate_diagnostics"][0]
-    assessment = audit["assessment_records"][0]
     assert diagnostic["extraction_status"] == ExtractionStatus.UNSUPPORTED.value
-    assert assessment["extraction_status"] == ExtractionStatus.UNSUPPORTED.value
-    assert assessment["eligible"] is False
 
 
 def test_equal_score_candidates_use_stable_name_and_id_order(monkeypatch):
